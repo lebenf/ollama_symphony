@@ -97,6 +97,12 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-04T15:28:44+00:00"
+    },
+    "8._Verifica_finale": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:28:59+00:00"
     }
   }
 }
