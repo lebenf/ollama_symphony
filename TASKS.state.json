@@ -25,6 +25,18 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-04T15:40:50+00:00"
+    },
+    "4.__ToolExecutor__class": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:42:48+00:00"
+    },
+    "5.__tests_test_tools.py": {
+      "status": "failed",
+      "attempts": 4,
+      "error": "Warning: no stdin data received in 3s, proceeding without it. If piping from a slow command, redirect stdin explicitly: < /dev/null to skip, or wait longer.",
+      "completed_at": null
     }
   }
 }

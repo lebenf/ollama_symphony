@@ -353,28 +353,36 @@ def execute_run_shell(command: str, working_dir: Path, timeout_s: int) -> ToolRe
             command, shell=True, capture_output=True, text=True,
             timeout=timeout_s, cwd=str(working_dir),
         )
-        output = result.stdout
-        if result.stderr:
-            output += "\n[stderr]\n" + result.stderr
+        output = (
+            f"exit_code: {result.returncode}\n"
+            f"stdout: {result.stdout.strip()}\n"
+            f"stderr: {result.stderr.strip()}"
+        )
         return ToolResult(
             tool_name="run_shell",
             success=result.returncode == 0,
-            output=output.strip(),
+            output=output,
             exit_code=result.returncode,
         )
     except subprocess.TimeoutExpired:
         return ToolResult(
             tool_name="run_shell", success=False,
             output=f"Command timed out after {timeout_s}s",
+            exit_code=-1,
         )
     except Exception as exc:
         return ToolResult(tool_name="run_shell", success=False, output=str(exc))
+
+
+_READ_FILE_MAX_CHARS = 8000
 
 
 def execute_read_file(path_str: str, working_dir: Path) -> ToolResult:
     try:
         safe = _safe_path(working_dir, path_str)
         content = safe.read_text(encoding="utf-8")
+        if len(content) > _READ_FILE_MAX_CHARS:
+            content = content[:_READ_FILE_MAX_CHARS] + f"\n[truncated — {len(content)} total chars]"
         return ToolResult(tool_name="read_file", success=True, output=content)
     except ValueError as exc:
         return ToolResult(tool_name="read_file", success=False, output=str(exc))
@@ -405,6 +413,8 @@ def execute_list_directory(path_str: str, working_dir: Path) -> ToolResult:
     try:
         safe = _safe_path(working_dir, path_str or ".")
         entries = sorted(safe.iterdir(), key=lambda p: (p.is_file(), p.name))
+        if not entries:
+            return ToolResult(tool_name="list_directory", success=True, output="(empty directory)")
         lines = [f"{e.name}{'/' if e.is_dir() else ''}" for e in entries]
         return ToolResult(tool_name="list_directory", success=True, output="\n".join(lines))
     except ValueError as exc:

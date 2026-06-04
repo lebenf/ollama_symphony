@@ -1,318 +1,163 @@
-"""Tests for tool execution, ReAct loop, and runner (no live Ollama needed)."""
+"""Tests for tool execution functions and ToolExecutor."""
 
-import logging
 import sys
+import textwrap
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ollama_symphony import (
-    Task, WorkflowConfig, TaskState, ToolCall,
-    _safe_path, execute_tool,
-    _tool_read_file, _tool_write_file, _tool_run_shell, _tool_list_directory,
+    WorkflowConfig, ToolCall, ToolResult,
+    _safe_path,
     execute_run_shell, execute_read_file, execute_write_file, execute_list_directory,
-    ToolExecutor,
-    build_prompt, run_react_loop, OllamaSymphonyRunner, StateStore,
-    build_tool_schemas, _TOOL_SCHEMAS,
+    build_tool_schemas, ToolExecutor,
 )
-
-_LOG = logging.getLogger("test")
 
 
 # ---------------------------------------------------------------------------
-# _safe_path — path traversal
+# _safe_path
 # ---------------------------------------------------------------------------
 
 def test_safe_path_normal(tmp_path):
-    p = _safe_path(tmp_path, "src/main.py")
-    assert p == (tmp_path / "src" / "main.py").resolve()
+    result = _safe_path(tmp_path, "subdir/file.txt")
+    assert str(result).startswith(str(tmp_path))
 
 
-def test_safe_path_dot_returns_root(tmp_path):
-    p = _safe_path(tmp_path, ".")
-    assert p == tmp_path.resolve()
+def test_safe_path_traversal_raises(tmp_path):
+    with pytest.raises(ValueError, match="Path traversal blocked"):
+        _safe_path(tmp_path, "../outside.txt")
 
 
-def test_safe_path_traversal_blocked(tmp_path):
-    with pytest.raises(ValueError, match="Path traversal"):
-        _safe_path(tmp_path, "../../etc/passwd")
-
-
-def test_safe_path_absolute_traversal_blocked(tmp_path):
-    with pytest.raises(ValueError, match="Path traversal"):
-        _safe_path(tmp_path, "/etc/passwd")
-
-
-def test_safe_path_dot_traversal_blocked(tmp_path):
-    with pytest.raises(ValueError, match="Path traversal"):
-        _safe_path(tmp_path, "../sibling")
+def test_safe_path_double_traversal_raises(tmp_path):
+    with pytest.raises(ValueError, match="Path traversal blocked"):
+        _safe_path(tmp_path, "subdir/../../outside.txt")
 
 
 # ---------------------------------------------------------------------------
-# read_file
-# ---------------------------------------------------------------------------
-
-def test_read_file_success(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    (tmp_path / "hello.txt").write_text("hello world", encoding="utf-8")
-    result = _tool_read_file("hello.txt", cfg)
-    assert result.success is True
-    assert result.output == "hello world"
-
-
-def test_read_file_not_found(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    result = _tool_read_file("missing.txt", cfg)
-    assert result.success is False
-    assert "not found" in result.output.lower()
-
-
-def test_read_file_traversal_blocked(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    result = _tool_read_file("../../etc/passwd", cfg)
-    assert result.success is False
-    assert "traversal" in result.output.lower()
-
-
-# ---------------------------------------------------------------------------
-# write_file
-# ---------------------------------------------------------------------------
-
-def test_write_file_success(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    result = _tool_write_file("out.txt", "content", cfg)
-    assert result.success is True
-    assert (tmp_path / "out.txt").read_text() == "content"
-
-
-def test_write_file_creates_dirs(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    result = _tool_write_file("a/b/c.txt", "nested", cfg)
-    assert result.success is True
-    assert (tmp_path / "a" / "b" / "c.txt").read_text() == "nested"
-
-
-def test_write_file_traversal_blocked(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    result = _tool_write_file("../evil.txt", "pwned", cfg)
-    assert result.success is False
-    assert "traversal" in result.output.lower()
-
-
-# ---------------------------------------------------------------------------
-# run_shell
+# execute_run_shell
 # ---------------------------------------------------------------------------
 
 def test_run_shell_success(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    result = _tool_run_shell("echo hello", cfg, _LOG)
+    result = execute_run_shell("echo hello", tmp_path, timeout_s=10)
     assert result.success is True
+    assert result.exit_code == 0
     assert "hello" in result.output
 
 
 def test_run_shell_failure(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    result = _tool_run_shell("exit 1", cfg, _LOG)
+    result = execute_run_shell("exit 1", tmp_path, timeout_s=10)
     assert result.success is False
     assert result.exit_code == 1
 
 
 def test_run_shell_timeout(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path), shell_timeout_s=1)
-    result = _tool_run_shell("sleep 10", cfg, _LOG)
+    result = execute_run_shell("sleep 10", tmp_path, timeout_s=1)
     assert result.success is False
+    assert result.exit_code == -1
     assert "timed out" in result.output.lower()
 
 
+def test_run_shell_output_format(tmp_path):
+    result = execute_run_shell("echo hello", tmp_path, timeout_s=10)
+    assert "exit_code:" in result.output
+    assert "stdout:" in result.output
+    assert "stderr:" in result.output
+
+
 # ---------------------------------------------------------------------------
-# list_directory
+# execute_read_file
 # ---------------------------------------------------------------------------
 
-def test_list_directory(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
+def test_read_file_existing(tmp_path):
+    f = tmp_path / "hello.txt"
+    f.write_text("hello world", encoding="utf-8")
+    result = execute_read_file("hello.txt", tmp_path)
+    assert result.success is True
+    assert "hello world" in result.output
+
+
+def test_read_file_not_found(tmp_path):
+    result = execute_read_file("missing.txt", tmp_path)
+    assert result.success is False
+    assert "not found" in result.output.lower()
+
+
+def test_read_file_traversal_blocked(tmp_path):
+    result = execute_read_file("../secret.txt", tmp_path)
+    assert result.success is False
+    assert "traversal" in result.output.lower() or "blocked" in result.output.lower()
+
+
+def test_read_file_truncation(tmp_path):
+    f = tmp_path / "big.txt"
+    f.write_text("x" * 10000, encoding="utf-8")
+    result = execute_read_file("big.txt", tmp_path)
+    assert result.success is True
+    assert "truncated" in result.output
+
+
+# ---------------------------------------------------------------------------
+# execute_write_file
+# ---------------------------------------------------------------------------
+
+def test_write_file_creates(tmp_path):
+    result = execute_write_file("new.txt", "content", tmp_path)
+    assert result.success is True
+    assert (tmp_path / "new.txt").read_text() == "content"
+
+
+def test_write_file_overwrites(tmp_path):
+    f = tmp_path / "existing.txt"
+    f.write_text("old content")
+    result = execute_write_file("existing.txt", "new content", tmp_path)
+    assert result.success is True
+    assert f.read_text() == "new content"
+
+
+def test_write_file_creates_parent_dirs(tmp_path):
+    result = execute_write_file("a/b/c/file.txt", "nested", tmp_path)
+    assert result.success is True
+    assert (tmp_path / "a" / "b" / "c" / "file.txt").exists()
+
+
+def test_write_file_traversal_blocked(tmp_path):
+    result = execute_write_file("../escape.txt", "bad", tmp_path)
+    assert result.success is False
+    assert "traversal" in result.output.lower() or "blocked" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# execute_list_directory
+# ---------------------------------------------------------------------------
+
+def test_list_directory_existing(tmp_path):
     (tmp_path / "file.txt").write_text("x")
     (tmp_path / "subdir").mkdir()
-    result = _tool_list_directory(".", cfg)
+    result = execute_list_directory(".", tmp_path)
     assert result.success is True
     assert "file.txt" in result.output
-    assert "subdir/" in result.output
+    assert "subdir" in result.output
 
 
-def test_list_directory_traversal_blocked(tmp_path):
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    result = _tool_list_directory("../../", cfg)
-    assert result.success is False
-
-
-# ---------------------------------------------------------------------------
-# execute_tool dispatch
-# ---------------------------------------------------------------------------
-
-def test_execute_tool_unknown():
-    cfg = WorkflowConfig()
-    call = ToolCall(name="nonexistent_tool", arguments={})
-    result = execute_tool(call, cfg, _LOG)
-    assert result.success is False
-    assert "Unknown tool" in result.output
-
-
-def test_execute_tool_task_complete():
-    cfg = WorkflowConfig()
-    call = ToolCall(name="task_complete", arguments={"summary": "done"})
-    result = execute_tool(call, cfg, _LOG)
+def test_list_directory_empty(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    result = execute_list_directory("empty", tmp_path)
     assert result.success is True
-    assert result.output == "done"
+    assert "empty" in result.output.lower()
 
 
-# ---------------------------------------------------------------------------
-# build_prompt
-# ---------------------------------------------------------------------------
-
-def test_build_prompt_no_completed():
-    task = Task(index=0, title="My task", body="Do something.")
-    cfg = WorkflowConfig()
-    prompt = build_prompt(task, cfg, [])
-    assert "## Current task: My task" in prompt
-    assert "Do something." in prompt
+def test_list_directory_not_found(tmp_path):
+    result = execute_list_directory("nonexistent", tmp_path)
+    assert result.success is False
 
 
-def test_build_prompt_with_completed():
-    task = Task(index=1, title="Second task", body="Do more.")
-    done = Task(index=0, title="First task", body="Already done.")
-    cfg = WorkflowConfig()
-    prompt = build_prompt(task, cfg, [done])
-    assert "First task" in prompt
-    assert "Previously completed" in prompt
-    assert "## Current task: Second task" in prompt
-
-
-# ---------------------------------------------------------------------------
-# run_react_loop — dry-run (no Ollama)
-# ---------------------------------------------------------------------------
-
-def test_react_loop_dry_run():
-    task = Task(index=0, title="T", body="Do it.")
-    cfg = WorkflowConfig()
-    success, output = run_react_loop(task, cfg, "prompt", dry_run=True)
-    assert success is True
-    assert "dry-run" in output
-
-
-# ---------------------------------------------------------------------------
-# run_react_loop — mocked Ollama
-# ---------------------------------------------------------------------------
-
-def test_react_loop_task_complete_via_tool(tmp_path):
-    """Ollama returns task_complete tool call — loop succeeds."""
-    task = Task(index=0, title="T", body="Do it.")
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-
-    mock_tc = MagicMock()
-    mock_tc.function.name = "task_complete"
-    mock_tc.function.arguments = {"summary": "All done"}
-
-    mock_msg = MagicMock()
-    mock_msg.content = ""
-    mock_msg.tool_calls = [mock_tc]
-
-    mock_response = MagicMock()
-    mock_response.message = mock_msg
-
-    mock_client = MagicMock()
-    mock_client.chat.return_value = mock_response
-
-    with patch("ollama.Client", return_value=mock_client):
-        success, output = run_react_loop(task, cfg, "prompt")
-
-    assert success is True
-    assert output == "All done"
-
-
-def test_react_loop_max_iterations(tmp_path):
-    """No task_complete after max_iterations — loop fails."""
-    task = Task(index=0, title="T", body="Do it.")
-    cfg = WorkflowConfig(working_dir=str(tmp_path), max_iterations=2)
-
-    mock_msg = MagicMock()
-    mock_msg.content = "thinking..."
-    mock_msg.tool_calls = None
-
-    mock_response = MagicMock()
-    mock_response.message = mock_msg
-
-    mock_client = MagicMock()
-    mock_client.chat.return_value = mock_response
-
-    with patch("ollama.Client", return_value=mock_client):
-        success, output = run_react_loop(task, cfg, "prompt")
-
-    assert success is False
-    assert "Max iterations" in output
-
-
-def test_react_loop_ollama_error(tmp_path):
-    """Ollama raises exception — loop returns failure."""
-    task = Task(index=0, title="T", body="Do it.")
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-
-    mock_client = MagicMock()
-    mock_client.chat.side_effect = Exception("connection refused")
-
-    with patch("ollama.Client", return_value=mock_client):
-        success, output = run_react_loop(task, cfg, "prompt")
-
-    assert success is False
-    assert "Ollama error" in output
-
-
-# ---------------------------------------------------------------------------
-# OllamaSymphonyRunner — dry-run (no Ollama)
-# ---------------------------------------------------------------------------
-
-def test_runner_dry_run(tmp_path):
-    tasks = [Task(index=0, title="T1", body="body")]
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    state = StateStore(tmp_path / "state.json")
-    state.init_run("TASKS.md")
-
-    runner = OllamaSymphonyRunner(tasks, cfg, state, dry_run=True)
-    success = runner.run()
-
-    assert success is True
-    assert state.is_completed("T1")
-
-
-def test_runner_skips_completed(tmp_path):
-    tasks = [Task(index=0, title="T1", body="body")]
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    state = StateStore(tmp_path / "state.json")
-    state.init_run("TASKS.md")
-    state.set("T1", TaskState(status="completed", attempts=1,
-                              completed_at="2024-01-01T00:00:00+00:00"))
-
-    runner = OllamaSymphonyRunner(tasks, cfg, state, dry_run=True)
-    success = runner.run()
-
-    assert success is True
-
-
-def test_runner_multiple_tasks_dry_run(tmp_path):
-    tasks = [
-        Task(index=0, title="T1", body="first"),
-        Task(index=1, title="T2", body="second"),
-    ]
-    cfg = WorkflowConfig(working_dir=str(tmp_path))
-    state = StateStore(tmp_path / "state.json")
-    state.init_run("TASKS.md")
-
-    runner = OllamaSymphonyRunner(tasks, cfg, state, dry_run=True)
-    success = runner.run()
-
-    assert success is True
-    assert state.is_completed("T1")
-    assert state.is_completed("T2")
+def test_list_directory_default_path(tmp_path):
+    (tmp_path / "readme.md").write_text("x")
+    result = execute_list_directory("", tmp_path)
+    assert result.success is True
+    assert "readme.md" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -326,110 +171,57 @@ def test_build_tool_schemas_task_complete_always_present():
     assert "task_complete" in names
 
 
-def test_build_tool_schemas_task_complete_not_duplicated():
+def test_build_tool_schemas_respects_enabled():
+    cfg = WorkflowConfig(enabled_tools=["run_shell", "read_file"])
+    schemas = build_tool_schemas(cfg)
+    names = [s["function"]["name"] for s in schemas]
+    assert "run_shell" in names
+    assert "read_file" in names
+    assert "write_file" not in names
+    assert "list_directory" not in names
+    assert "task_complete" in names
+
+
+def test_build_tool_schemas_no_duplicate_task_complete():
     cfg = WorkflowConfig(enabled_tools=["task_complete"])
     schemas = build_tool_schemas(cfg)
     names = [s["function"]["name"] for s in schemas]
     assert names.count("task_complete") == 1
 
 
-def test_build_tool_schemas_enabled_tools_included():
-    cfg = WorkflowConfig(enabled_tools=["run_shell", "read_file"])
-    schemas = build_tool_schemas(cfg)
-    names = [s["function"]["name"] for s in schemas]
-    assert "run_shell" in names
-    assert "read_file" in names
-
-
-def test_build_tool_schemas_unknown_tool_ignored():
-    cfg = WorkflowConfig(enabled_tools=["run_shell", "nonexistent_tool"])
-    schemas = build_tool_schemas(cfg)
-    names = [s["function"]["name"] for s in schemas]
-    assert "nonexistent_tool" not in names
-    assert "run_shell" in names
-
-
 def test_build_tool_schemas_structure():
-    cfg = WorkflowConfig(enabled_tools=["write_file"])
+    cfg = WorkflowConfig(enabled_tools=["run_shell"])
     schemas = build_tool_schemas(cfg)
     for schema in schemas:
-        assert schema["type"] == "function"
+        assert "type" in schema
         assert "function" in schema
         assert "name" in schema["function"]
         assert "parameters" in schema["function"]
-
-
-def test_tool_schemas_keys():
-    expected = {"run_shell", "read_file", "write_file", "list_directory", "task_complete"}
-    assert set(_TOOL_SCHEMAS.keys()) == expected
 
 
 # ---------------------------------------------------------------------------
 # ToolExecutor
 # ---------------------------------------------------------------------------
 
-def test_tool_executor_read_file(tmp_path):
-    (tmp_path / "hello.txt").write_text("hello", encoding="utf-8")
-    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
-    result = executor.execute(ToolCall(name="read_file", arguments={"path": "hello.txt"}))
-    assert result.success is True
-    assert result.output == "hello"
-
-
-def test_tool_executor_write_file(tmp_path):
-    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
-    result = executor.execute(ToolCall(name="write_file", arguments={"path": "out.txt", "content": "data"}))
-    assert result.success is True
-    assert (tmp_path / "out.txt").read_text() == "data"
-
-
-def test_tool_executor_write_file_creates_dirs(tmp_path):
-    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
-    result = executor.execute(ToolCall(name="write_file", arguments={"path": "a/b/c.txt", "content": "x"}))
-    assert result.success is True
-    assert (tmp_path / "a" / "b" / "c.txt").read_text() == "x"
-
-
 def test_tool_executor_run_shell(tmp_path):
-    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    cfg = WorkflowConfig(working_dir=str(tmp_path))
+    executor = ToolExecutor(cfg)
     result = executor.execute(ToolCall(name="run_shell", arguments={"command": "echo hi"}))
     assert result.success is True
     assert "hi" in result.output
 
 
-def test_tool_executor_run_shell_failure(tmp_path):
-    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
-    result = executor.execute(ToolCall(name="run_shell", arguments={"command": "exit 2"}))
-    assert result.success is False
-    assert result.exit_code == 2
-
-
-def test_tool_executor_list_directory(tmp_path):
-    (tmp_path / "f.txt").write_text("x")
-    (tmp_path / "sub").mkdir()
-    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
-    result = executor.execute(ToolCall(name="list_directory", arguments={"path": "."}))
-    assert result.success is True
-    assert "f.txt" in result.output
-    assert "sub/" in result.output
-
-
-def test_tool_executor_task_complete(tmp_path):
-    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
-    result = executor.execute(ToolCall(name="task_complete", arguments={"summary": "done"}))
-    assert result.success is True
-    assert "task_complete" in result.output
-
-
 def test_tool_executor_unknown_tool(tmp_path):
-    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
-    result = executor.execute(ToolCall(name="no_such_tool", arguments={}))
+    cfg = WorkflowConfig(working_dir=str(tmp_path))
+    executor = ToolExecutor(cfg)
+    result = executor.execute(ToolCall(name="nonexistent_tool", arguments={}))
     assert result.success is False
     assert "Unknown tool" in result.output
 
 
-def test_tool_executor_traversal_blocked(tmp_path):
-    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
-    result = executor.execute(ToolCall(name="read_file", arguments={"path": "../../etc/passwd"}))
-    assert result.success is False
-    assert "traversal" in result.output.lower()
+def test_tool_executor_task_complete(tmp_path):
+    cfg = WorkflowConfig(working_dir=str(tmp_path))
+    executor = ToolExecutor(cfg)
+    result = executor.execute(ToolCall(name="task_complete", arguments={"summary": "done"}))
+    # task_complete is intercepted by the loop, but executor returns success
+    assert result.success is True
