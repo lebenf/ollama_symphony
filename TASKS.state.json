@@ -19,6 +19,12 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-04T15:39:39+00:00"
+    },
+    "3._Tool_schemas__JSON_format_for_Ollama": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:40:50+00:00"
     }
   }
 }
