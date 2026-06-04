@@ -25,6 +25,18 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-04T15:13:45+00:00"
+    },
+    "3._File_di_esempio___WORKFLOW.md": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:14:04+00:00"
+    },
+    "4._File_di_esempio___TASKS.md": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:14:20+00:00"
     }
   }
 }
