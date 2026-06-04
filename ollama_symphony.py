@@ -347,13 +347,16 @@ ALL_TOOL_DEFS: dict[str, dict] = {
 # Tool execution
 # ---------------------------------------------------------------------------
 
-def _safe_path(path_str: str, working_dir: str) -> Path:
-    """Resolve path_str relative to working_dir; raise ValueError on traversal."""
-    base = Path(working_dir).resolve()
-    target = (base / path_str).resolve()
-    if target != base and not str(target).startswith(str(base) + os.sep):
-        raise ValueError(f"Path traversal blocked: {path_str!r} escapes working dir")
-    return target
+def _safe_path(working_dir: Path, user_path: str) -> Path:
+    """
+    Resolve user_path relative to working_dir and verify it stays inside.
+    Raises ValueError if the resolved path escapes working_dir.
+    """
+    resolved = (working_dir / user_path).resolve()
+    root = working_dir.resolve()
+    if not str(resolved).startswith(str(root) + os.sep) and resolved != root:
+        raise ValueError(f"Path traversal blocked: {user_path!r} resolves outside working dir")
+    return resolved
 
 
 def execute_tool(
@@ -410,7 +413,7 @@ def _tool_run_shell(command: str, config: "WorkflowConfig", logger: logging.Logg
 
 def _tool_read_file(path_str: str, config: "WorkflowConfig") -> ToolResult:
     try:
-        safe = _safe_path(path_str, config.working_dir)
+        safe = _safe_path(Path(config.working_dir), path_str)
         content = safe.read_text(encoding="utf-8")
         return ToolResult(tool_name="read_file", success=True, output=content)
     except ValueError as exc:
@@ -425,7 +428,7 @@ def _tool_read_file(path_str: str, config: "WorkflowConfig") -> ToolResult:
 
 def _tool_write_file(path_str: str, content: str, config: "WorkflowConfig") -> ToolResult:
     try:
-        safe = _safe_path(path_str, config.working_dir)
+        safe = _safe_path(Path(config.working_dir), path_str)
         safe.parent.mkdir(parents=True, exist_ok=True)
         safe.write_text(content, encoding="utf-8")
         return ToolResult(
@@ -440,7 +443,7 @@ def _tool_write_file(path_str: str, content: str, config: "WorkflowConfig") -> T
 
 def _tool_list_directory(path_str: str, config: "WorkflowConfig") -> ToolResult:
     try:
-        safe = _safe_path(path_str or ".", config.working_dir)
+        safe = _safe_path(Path(config.working_dir), path_str or ".")
         entries = sorted(safe.iterdir(), key=lambda p: (p.is_file(), p.name))
         lines = [f"{e.name}{'/' if e.is_dir() else ''}" for e in entries]
         return ToolResult(tool_name="list_directory", success=True, output="\n".join(lines))

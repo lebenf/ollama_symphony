@@ -1,13 +1,13 @@
 # Task 2 — Tool Registry e sicurezza path
 
-## Prerequisiti
+### Prerequisiti
 
 Il Task 1 deve essere completato: `ollama_symphony.py` deve già contenere i dataclass
 (`Task`, `WorkflowConfig`, `TaskState`, `ToolCall`, `ToolResult`) e le funzioni di parsing.
 
 ---
 
-## Obiettivo
+### Obiettivo
 
 Implementare il sistema di tool che il loop ReAct userà per eseguire azioni concrete:
 eseguire comandi shell, leggere/scrivere file, listare directory. Include la prevenzione
@@ -15,7 +15,7 @@ del path traversal e gli schemi JSON per il tool calling Ollama.
 
 ---
 
-## Cosa aggiungere a `ollama_symphony.py`
+### Cosa aggiungere a `ollama_symphony.py`
 
 Aggiungi queste sezioni **dopo** i dataclass e il parsing, **prima** del placeholder `main()`.
 

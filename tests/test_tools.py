@@ -23,23 +23,28 @@ _LOG = logging.getLogger("test")
 # ---------------------------------------------------------------------------
 
 def test_safe_path_normal(tmp_path):
-    p = _safe_path("src/main.py", str(tmp_path))
+    p = _safe_path(tmp_path, "src/main.py")
     assert p == (tmp_path / "src" / "main.py").resolve()
+
+
+def test_safe_path_dot_returns_root(tmp_path):
+    p = _safe_path(tmp_path, ".")
+    assert p == tmp_path.resolve()
 
 
 def test_safe_path_traversal_blocked(tmp_path):
     with pytest.raises(ValueError, match="Path traversal"):
-        _safe_path("../../etc/passwd", str(tmp_path))
+        _safe_path(tmp_path, "../../etc/passwd")
 
 
 def test_safe_path_absolute_traversal_blocked(tmp_path):
     with pytest.raises(ValueError, match="Path traversal"):
-        _safe_path("/etc/passwd", str(tmp_path))
+        _safe_path(tmp_path, "/etc/passwd")
 
 
 def test_safe_path_dot_traversal_blocked(tmp_path):
     with pytest.raises(ValueError, match="Path traversal"):
-        _safe_path("../sibling", str(tmp_path))
+        _safe_path(tmp_path, "../sibling")
 
 
 # ---------------------------------------------------------------------------

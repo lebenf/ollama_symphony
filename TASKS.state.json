@@ -1,5 +1,12 @@
 {
   "started_at": "2026-06-04T15:36:37+00:00",
   "tasks_file": "TASKS.md",
-  "tasks": {}
+  "tasks": {
+    "Prerequisiti": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:36:53+00:00"
+    }
+  }
 }
