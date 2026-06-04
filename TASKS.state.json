@@ -13,6 +13,12 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-04T15:13:10+00:00"
+    },
+    "1.__requirements.txt": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:13:21+00:00"
     }
   }
 }
