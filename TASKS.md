@@ -1,799 +1,594 @@
-# Task 1 — Setup struttura progetto e domain model
+# Task 2 — Tool Registry e sicurezza path
+
+## Prerequisiti
+
+Il Task 1 deve essere completato: `ollama_symphony.py` deve già contenere i dataclass
+(`Task`, `WorkflowConfig`, `TaskState`, `ToolCall`, `ToolResult`) e le funzioni di parsing.
+
+---
 
 ## Obiettivo
 
-Creare la struttura base del progetto `ollama_symphony/` con il domain model, le funzioni di
-parsing e la persistenza dello stato. Questo task non richiede Ollama né tool calling: getta le
-fondamenta su cui i task successivi costruiranno.
+Implementare il sistema di tool che il loop ReAct userà per eseguire azioni concrete:
+eseguire comandi shell, leggere/scrivere file, listare directory. Include la prevenzione
+del path traversal e gli schemi JSON per il tool calling Ollama.
 
 ---
 
-## Struttura da creare
+## Cosa aggiungere a `ollama_symphony.py`
 
-```
-ollama_symphony/
-├── ollama_symphony.py
-├── WORKFLOW.md
-├── TASKS.md
-├── requirements.txt
-├── README.md
-└── tests/
-    ├── __init__.py
-    └── test_parsing.py
+Aggiungi queste sezioni **dopo** i dataclass e il parsing, **prima** del placeholder `main()`.
+
+---
+
+## 1. Safety — Path traversal prevention
+
+```python
+# ---------------------------------------------------------------------------
+# Tool safety
+# ---------------------------------------------------------------------------
+
+def _safe_path(working_dir: Path, user_path: str) -> Path:
+    """
+    Resolve user_path relative to working_dir and verify it stays inside.
+    Raises ValueError if the resolved path escapes working_dir.
+    """
+    resolved = (working_dir / user_path).resolve()
+    root = working_dir.resolve()
+    if not str(resolved).startswith(str(root) + os.sep) and resolved != root:
+        raise ValueError(f"Path traversal blocked: {user_path!r} resolves outside working dir")
+    return resolved
 ```
 
 ---
 
-## 1. `requirements.txt`
-
-```
-ollama>=0.3.0
-pyyaml>=6.0
-pytest>=8.0
-pytest-timeout>=2.3
-```
-
----
-
-## 2. `ollama_symphony.py` — Domain model e parsing
-
-Crea il file con i seguenti contenuti **nell'ordine indicato**.
-
-### 2.1 Header e imports
+## 2. Tool execution functions
 
 ```python
-#!/usr/bin/env python3
-"""
-Ollama Symphony — sequential task runner for local Ollama models.
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
 
-Reads tasks from TASKS.md, executes them via a ReAct loop with tool calling,
-commits results to git. Compatible with symphony.py state files.
-
-Usage:
-    python ollama_symphony.py [--tasks TASKS.md] [--workflow WORKFLOW.md] [--dry-run]
-"""
-
-import argparse
-import json
-import logging
-import os
-import re
-import subprocess
-import sys
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
-
-import yaml  # pip install pyyaml
-```
-
-### 2.2 Dataclass `Task`
-
-```python
-@dataclass
-class Task:
-    index: int          # 0-based position in file
-    title: str          # text of the ## heading
-    body: str           # markdown body of the task
-    slug: str = ""      # sanitized key used in state file
-
-    def __post_init__(self):
-        if not self.slug:
-            self.slug = _slugify(self.title)
-```
-
-### 2.3 Dataclass `WorkflowConfig`
-
-```python
-@dataclass
-class WorkflowConfig:
-    # agent settings
-    max_retries: int = 3
-    retry_delay_s: float = 10.0
-    turn_timeout_s: int = 600
-    max_iterations: int = 20        # max ReAct iterations per task
-
-    # git settings
-    commit_after_each_task: bool = True
-    commit_message_template: str = "feat: {task_title}"
-
-    # ollama settings
-    ollama_hosts: list[str] = field(default_factory=lambda: ["http://localhost:11434"])
-    ollama_model: str = "qwen2.5-coder:7b"
-    ollama_timeout_s: int = 120
-    ollama_temperature: float = 0.2
-    ollama_context_window: int = 8192
-    ollama_num_ctx: int = 8192
-
-    # tool settings
-    enabled_tools: list[str] = field(default_factory=lambda: [
-        "run_shell", "read_file", "write_file", "list_directory"
-    ])
-    shell_timeout_s: int = 30
-    working_dir: str = "."
-
-    # system prompt
-    system_prompt: str = (
-        "You are an autonomous development agent working on a software project.\n"
-        "For each task assigned to you:\n"
-        "1. Read the task description carefully.\n"
-        "2. Implement the required code changes using the available tools.\n"
-        "3. Write the tests specified in the task.\n"
-        "4. Run the test suite and iterate until all tests pass.\n"
-        "5. Do not ask for confirmation — proceed autonomously.\n"
-        "6. When the task is complete, call the `task_complete` tool with a brief summary."
-    )
-```
-
-### 2.4 Dataclasses `TaskState`, `ToolCall`, `ToolResult`
-
-```python
-@dataclass
-class TaskState:
-    status: str           # "pending" | "completed" | "failed"
-    attempts: int = 0
-    error: Optional[str] = None
-    completed_at: Optional[str] = None
-
-
-@dataclass
-class ToolCall:
-    name: str
-    arguments: dict
-
-
-@dataclass
-class ToolResult:
-    tool_name: str
-    success: bool
-    output: str           # stdout / file content / error message
-    exit_code: Optional[int] = None
-```
-
-### 2.5 Funzioni di parsing
-
-Queste funzioni devono essere **identiche** a quelle di `symphony.py` per garantire compatibilità
-con i file esistenti.
-
-```python
-def _slugify(text: str) -> str:
-    """Convert a task title to a safe dict key."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", text).strip("_")
-
-
-def parse_tasks(path: Path) -> list[Task]:
-    """
-    Parse TASKS.md into an ordered list of Task objects.
-    Each ## heading starts a new task; the body is everything until the next ##.
-    Compatible with symphony.py TASKS.md format.
-    """
-    content = path.read_text(encoding="utf-8")
-    tasks: list[Task] = []
-
-    parts = re.split(r"^##\s+(.+)$", content, flags=re.MULTILINE)
-    it = iter(parts[1:])
-    for index, (title, body) in enumerate(zip(it, it)):
-        tasks.append(Task(index=index, title=title.strip(), body=body.strip()))
-
-    if not tasks:
-        raise ValueError(f"No tasks found in {path}. Use ## headings to define tasks.")
-
-    return tasks
-
-
-def parse_workflow(path: Path) -> WorkflowConfig:
-    """
-    Parse WORKFLOW.md with optional YAML front matter.
-    Extends symphony.py format with ollama and tools sections.
-    Returns WorkflowConfig.
-    """
-    content = path.read_text(encoding="utf-8")
-    config = WorkflowConfig()
-
-    if content.startswith("---"):
-        end = content.find("\n---", 3)
-        if end != -1:
-            front_matter = content[3:end].strip()
-            body = content[end + 4:].strip()
-            data = yaml.safe_load(front_matter) or {}
-
-            # agent section
-            agent_cfg = data.get("agent", {})
-            if "max_retries" in agent_cfg:
-                config.max_retries = int(agent_cfg["max_retries"])
-            if "retry_delay_s" in agent_cfg:
-                config.retry_delay_s = float(agent_cfg["retry_delay_s"])
-            if "turn_timeout_s" in agent_cfg:
-                config.turn_timeout_s = int(agent_cfg["turn_timeout_s"])
-            if "max_iterations" in agent_cfg:
-                config.max_iterations = int(agent_cfg["max_iterations"])
-
-            # git section
-            git_cfg = data.get("git", {})
-            if "commit_after_each_task" in git_cfg:
-                config.commit_after_each_task = bool(git_cfg["commit_after_each_task"])
-            if "commit_message_template" in git_cfg:
-                config.commit_message_template = str(git_cfg["commit_message_template"])
-
-            # ollama section
-            ollama_cfg = data.get("ollama", {})
-            if "hosts" in ollama_cfg:
-                config.ollama_hosts = list(ollama_cfg["hosts"])
-            if "model" in ollama_cfg:
-                config.ollama_model = str(ollama_cfg["model"])
-            if "timeout_s" in ollama_cfg:
-                config.ollama_timeout_s = int(ollama_cfg["timeout_s"])
-            if "temperature" in ollama_cfg:
-                config.ollama_temperature = float(ollama_cfg["temperature"])
-            if "context_window" in ollama_cfg:
-                config.ollama_context_window = int(ollama_cfg["context_window"])
-            if "num_ctx" in ollama_cfg:
-                config.ollama_num_ctx = int(ollama_cfg["num_ctx"])
-
-            # tools section
-            tools_cfg = data.get("tools", {})
-            if "enabled" in tools_cfg:
-                config.enabled_tools = list(tools_cfg["enabled"])
-            if "shell_timeout_s" in tools_cfg:
-                config.shell_timeout_s = int(tools_cfg["shell_timeout_s"])
-            if "working_dir" in tools_cfg:
-                config.working_dir = str(tools_cfg["working_dir"])
-
-            if body:
-                config.system_prompt = body
-        else:
-            config.system_prompt = content.strip()
-    else:
-        body = content.strip()
-        if body:
-            config.system_prompt = body
-
-    return config
-```
-
-### 2.6 `StateStore`
-
-Identica a `symphony.py`:
-
-```python
-class StateStore:
-    """
-    Persists task progress to a JSON file so runs can be resumed.
-    Schema-compatible with symphony.py state files.
-    """
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._data: dict = {}
-        self._load()
-
-    def _load(self):
-        if self.path.exists():
-            try:
-                self._data = json.loads(self.path.read_text(encoding="utf-8"))
-            except Exception:
-                self._data = {}
-
-    def _save(self):
-        self.path.write_text(
-            json.dumps(self._data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+def execute_run_shell(
+    command: str,
+    working_dir: Path,
+    timeout_s: int,
+) -> ToolResult:
+    """Execute a shell command in working_dir. Returns ToolResult."""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=working_dir,
+            timeout=timeout_s,
+            capture_output=True,
+            text=True,
+        )
+        stdout = result.stdout[:4000] if result.stdout else ""
+        stderr = result.stderr[:2000] if result.stderr else ""
+        output = f"exit_code: {result.returncode}\nstdout: {stdout}\nstderr: {stderr}"
+        return ToolResult(
+            tool_name="run_shell",
+            success=result.returncode == 0,
+            output=output,
+            exit_code=result.returncode,
+        )
+    except subprocess.TimeoutExpired:
+        return ToolResult(
+            tool_name="run_shell",
+            success=False,
+            output=f"exit_code: -1\nstdout: \nstderr: Command timed out after {timeout_s}s",
+            exit_code=-1,
+        )
+    except Exception as exc:
+        return ToolResult(
+            tool_name="run_shell",
+            success=False,
+            output=f"exit_code: -1\nstdout: \nstderr: Error: {exc}",
+            exit_code=-1,
         )
 
-    def init_run(self, tasks_file: str):
-        if "started_at" not in self._data:
-            self._data["started_at"] = _now_iso()
-        self._data["tasks_file"] = tasks_file
-        if "tasks" not in self._data:
-            self._data["tasks"] = {}
-        self._save()
 
-    def get(self, slug: str) -> Optional[TaskState]:
-        raw = self._data.get("tasks", {}).get(slug)
-        if raw is None:
-            return None
-        return TaskState(**raw)
+def execute_read_file(path: str, working_dir: Path) -> ToolResult:
+    """Read a file relative to working_dir. Blocks path traversal."""
+    try:
+        safe = _safe_path(working_dir, path)
+        content = safe.read_text(encoding="utf-8")
+        if len(content) > 8000:
+            content = content[:8000] + "\n[... truncated ...]"
+        return ToolResult(tool_name="read_file", success=True, output=content)
+    except ValueError as exc:
+        return ToolResult(tool_name="read_file", success=False, output=str(exc))
+    except FileNotFoundError:
+        return ToolResult(tool_name="read_file", success=False, output=f"File not found: {path}")
+    except Exception as exc:
+        return ToolResult(tool_name="read_file", success=False, output=f"Error reading file: {exc}")
 
-    def set(self, slug: str, state: TaskState):
-        self._data.setdefault("tasks", {})[slug] = {
-            "status": state.status,
-            "attempts": state.attempts,
-            "error": state.error,
-            "completed_at": state.completed_at,
-        }
-        self._save()
 
-    def is_completed(self, slug: str) -> bool:
-        s = self.get(slug)
-        return s is not None and s.status == "completed"
+def execute_write_file(path: str, content: str, working_dir: Path) -> ToolResult:
+    """Write content to a file relative to working_dir. Creates parent dirs. Blocks path traversal."""
+    try:
+        safe = _safe_path(working_dir, path)
+        safe.parent.mkdir(parents=True, exist_ok=True)
+        safe.write_text(content, encoding="utf-8")
+        return ToolResult(
+            tool_name="write_file",
+            success=True,
+            output=f"Written {len(content)} chars to {path}",
+        )
+    except ValueError as exc:
+        return ToolResult(tool_name="write_file", success=False, output=str(exc))
+    except Exception as exc:
+        return ToolResult(tool_name="write_file", success=False, output=f"Error writing file: {exc}")
+
+
+def execute_list_directory(path: str, working_dir: Path) -> ToolResult:
+    """List files and directories at path relative to working_dir."""
+    target_path = path if path else "."
+    try:
+        safe = _safe_path(working_dir, target_path)
+        if not safe.exists():
+            return ToolResult(
+                tool_name="list_directory",
+                success=False,
+                output=f"Path not found: {target_path}",
+            )
+        if not safe.is_dir():
+            return ToolResult(
+                tool_name="list_directory",
+                success=False,
+                output=f"Not a directory: {target_path}",
+            )
+        entries = sorted(safe.iterdir(), key=lambda p: (p.is_file(), p.name))
+        lines = []
+        for entry in entries[:200]:
+            kind = "file" if entry.is_file() else "dir"
+            lines.append(f"{kind}: {entry.name}")
+        if len(list(safe.iterdir())) > 200:
+            lines.append("[... truncated at 200 entries ...]")
+        output = "\n".join(lines) if lines else "(empty directory)"
+        return ToolResult(tool_name="list_directory", success=True, output=output)
+    except ValueError as exc:
+        return ToolResult(tool_name="list_directory", success=False, output=str(exc))
+    except Exception as exc:
+        return ToolResult(
+            tool_name="list_directory", success=False, output=f"Error listing directory: {exc}"
+        )
 ```
 
-### 2.7 Utility
+---
+
+## 3. Tool schemas (JSON format for Ollama)
 
 ```python
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+# ---------------------------------------------------------------------------
+# Tool schemas
+# ---------------------------------------------------------------------------
+
+_TOOL_SCHEMAS: dict[str, dict] = {
+    "run_shell": {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": (
+                "Execute a shell command in the working directory. "
+                "Use for running tests, installing packages, git commands, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute",
+                    }
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    "read_file": {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the content of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to working directory",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    "write_file": {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file, creating it or overwriting it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to working directory",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write to the file",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    "list_directory": {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and directories at a path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path relative to working directory (default: '.')",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    "task_complete": {
+        "type": "function",
+        "function": {
+            "name": "task_complete",
+            "description": (
+                "Call this when the task is fully completed and all tests pass. "
+                "This signals the runner that the task is done."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief description of what was implemented",
+                    }
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+}
 
 
-def setup_logging(verbose: bool = False):
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        datefmt="%H:%M:%S",
-        level=level,
-        stream=sys.stderr,
-    )
+def build_tool_schemas(config: WorkflowConfig) -> list[dict]:
+    """
+    Return the list of tool schemas to pass to Ollama.
+    Always includes task_complete regardless of config.enabled_tools.
+    """
+    schemas = []
+    for name in config.enabled_tools:
+        if name in _TOOL_SCHEMAS and name != "task_complete":
+            schemas.append(_TOOL_SCHEMAS[name])
+    # task_complete is always present
+    schemas.append(_TOOL_SCHEMAS["task_complete"])
+    return schemas
 ```
 
-### 2.8 Placeholder `main()`
+---
 
-Aggiungi in fondo al file un `main()` minimale che verrà completato nel Task 4:
+## 4. `ToolExecutor` class
 
 ```python
-def main():
-    setup_logging()
-    logging.getLogger("ollama_symphony").info("ollama_symphony placeholder — run tasks 2-4 first")
+# ---------------------------------------------------------------------------
+# Tool executor
+# ---------------------------------------------------------------------------
 
+class ToolExecutor:
+    """Dispatches tool calls to the appropriate implementation function."""
 
-if __name__ == "__main__":
-    main()
+    def __init__(self, config: WorkflowConfig):
+        self.config = config
+        self._working_dir = Path(config.working_dir).resolve()
+
+    def execute(self, tool_call: ToolCall) -> ToolResult:
+        """Execute a tool call and return the result."""
+        match tool_call.name:
+            case "run_shell":
+                command = tool_call.arguments.get("command", "")
+                return execute_run_shell(command, self._working_dir, self.config.shell_timeout_s)
+            case "read_file":
+                path = tool_call.arguments.get("path", "")
+                return execute_read_file(path, self._working_dir)
+            case "write_file":
+                path = tool_call.arguments.get("path", "")
+                content = tool_call.arguments.get("content", "")
+                return execute_write_file(path, content, self._working_dir)
+            case "list_directory":
+                path = tool_call.arguments.get("path", ".")
+                return execute_list_directory(path, self._working_dir)
+            case "task_complete":
+                # task_complete is handled by the ReAct loop, not executed here
+                return ToolResult(
+                    tool_name="task_complete",
+                    success=True,
+                    output="[task_complete signal — handled by runner]",
+                )
+            case _:
+                return ToolResult(
+                    tool_name=tool_call.name,
+                    success=False,
+                    output=f"Unknown tool: {tool_call.name!r}",
+                )
 ```
 
 ---
 
-## 3. File di esempio: `WORKFLOW.md`
-
-```yaml
----
-agent:
-  max_retries: 3
-  retry_delay_s: 10
-  turn_timeout_s: 600
-  max_iterations: 20
-
-git:
-  commit_after_each_task: true
-  commit_message_template: "feat: {task_title}"
-
-ollama:
-  hosts:
-    - http://localhost:11434
-  model: qwen2.5-coder:7b
-  timeout_s: 120
-  temperature: 0.2
-  context_window: 8192
-  num_ctx: 8192
-
-tools:
-  enabled:
-    - run_shell
-    - read_file
-    - write_file
-    - list_directory
-  shell_timeout_s: 30
-  working_dir: "."
----
-You are an autonomous development agent working on a software project.
-
-For each task assigned to you:
-1. Read the task description carefully.
-2. Implement the required code changes using the available tools.
-3. Write the tests specified in the task.
-4. Run the test suite and iterate until all tests pass.
-5. Do not ask for confirmation — proceed autonomously.
-6. When the task is complete, call the `task_complete` tool with a brief summary.
-```
-
----
-
-## 4. File di esempio: `TASKS.md`
-
-```markdown
-# Project Tasks
-
-## Task 1: Setup project structure
-
-Create the basic project structure with the following files:
-- `src/__init__.py`
-- `src/models.py` with a `User` dataclass (fields: id, name, email)
-- `tests/__init__.py`
-- `tests/test_models.py` with at least one test that verifies the User dataclass works correctly
-
-Run the tests with `pytest` and make sure they pass.
-
-## Task 2: Add validation logic
-
-In `src/models.py`, add a `validate_email(email: str) -> bool` function.
-
-Add tests covering valid and invalid emails.
-Run the tests and make sure they all pass.
-```
-
----
-
-## 5. `tests/__init__.py`
-
-File vuoto.
-
----
-
-## 6. `tests/test_parsing.py`
+## 5. `tests/test_tools.py`
 
 ```python
-"""Tests for parse_tasks, parse_workflow, _slugify, and StateStore."""
+"""Tests for tool execution functions and ToolExecutor."""
 
-import json
+import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 
-# Import from the main module
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ollama_symphony import (
-    Task, WorkflowConfig, TaskState,
-    parse_tasks, parse_workflow, _slugify, StateStore,
+    WorkflowConfig, ToolCall, ToolResult,
+    _safe_path,
+    execute_run_shell, execute_read_file, execute_write_file, execute_list_directory,
+    build_tool_schemas, ToolExecutor,
 )
 
 
 # ---------------------------------------------------------------------------
-# _slugify
+# _safe_path
 # ---------------------------------------------------------------------------
 
-def test_slugify_simple():
-    assert _slugify("Hello World") == "Hello_World"
-
-def test_slugify_special_chars():
-    assert _slugify("Task 1: Setup/Init") == "Task_1__Setup_Init"
-
-def test_slugify_already_clean():
-    assert _slugify("my-task.v2") == "my-task.v2"
-
-def test_slugify_strips_underscores():
-    assert _slugify("  spaces  ") == "spaces"
+def test_safe_path_normal(tmp_path):
+    result = _safe_path(tmp_path, "subdir/file.txt")
+    assert str(result).startswith(str(tmp_path))
 
 
-# ---------------------------------------------------------------------------
-# parse_tasks
-# ---------------------------------------------------------------------------
-
-SAMPLE_TASKS_MD = textwrap.dedent("""\
-    # Project Tasks
-
-    ## Task 1: First task
-
-    Body of the first task.
-    Multi-line body.
-
-    ## Task 2: Second task
-
-    Body of the second task.
-""")
+def test_safe_path_traversal_raises(tmp_path):
+    with pytest.raises(ValueError, match="Path traversal blocked"):
+        _safe_path(tmp_path, "../outside.txt")
 
 
-def test_parse_tasks_count(tmp_path):
-    f = tmp_path / "TASKS.md"
-    f.write_text(SAMPLE_TASKS_MD, encoding="utf-8")
-    tasks = parse_tasks(f)
-    assert len(tasks) == 2
-
-
-def test_parse_tasks_titles(tmp_path):
-    f = tmp_path / "TASKS.md"
-    f.write_text(SAMPLE_TASKS_MD, encoding="utf-8")
-    tasks = parse_tasks(f)
-    assert tasks[0].title == "Task 1: First task"
-    assert tasks[1].title == "Task 2: Second task"
-
-
-def test_parse_tasks_body(tmp_path):
-    f = tmp_path / "TASKS.md"
-    f.write_text(SAMPLE_TASKS_MD, encoding="utf-8")
-    tasks = parse_tasks(f)
-    assert "Multi-line body" in tasks[0].body
-    assert "second task" in tasks[1].body
-
-
-def test_parse_tasks_index(tmp_path):
-    f = tmp_path / "TASKS.md"
-    f.write_text(SAMPLE_TASKS_MD, encoding="utf-8")
-    tasks = parse_tasks(f)
-    assert tasks[0].index == 0
-    assert tasks[1].index == 1
-
-
-def test_parse_tasks_slug_generated(tmp_path):
-    f = tmp_path / "TASKS.md"
-    f.write_text(SAMPLE_TASKS_MD, encoding="utf-8")
-    tasks = parse_tasks(f)
-    assert tasks[0].slug != ""
-    assert tasks[1].slug != ""
-    assert tasks[0].slug != tasks[1].slug
-
-
-def test_parse_tasks_empty_raises(tmp_path):
-    f = tmp_path / "TASKS.md"
-    f.write_text("# Just a header, no tasks\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="No tasks found"):
-        parse_tasks(f)
+def test_safe_path_double_traversal_raises(tmp_path):
+    with pytest.raises(ValueError, match="Path traversal blocked"):
+        _safe_path(tmp_path, "subdir/../../outside.txt")
 
 
 # ---------------------------------------------------------------------------
-# parse_workflow — no front matter
+# execute_run_shell
 # ---------------------------------------------------------------------------
 
-def test_parse_workflow_no_frontmatter(tmp_path):
-    f = tmp_path / "WORKFLOW.md"
-    f.write_text("You are a dev agent.\n", encoding="utf-8")
-    cfg = parse_workflow(f)
-    assert isinstance(cfg, WorkflowConfig)
-    assert "dev agent" in cfg.system_prompt
-    # defaults preserved
-    assert cfg.max_retries == 3
-    assert cfg.ollama_model == "qwen2.5-coder:7b"
+def test_run_shell_success(tmp_path):
+    result = execute_run_shell("echo hello", tmp_path, timeout_s=10)
+    assert result.success is True
+    assert result.exit_code == 0
+    assert "hello" in result.output
 
 
-# ---------------------------------------------------------------------------
-# parse_workflow — with front matter, agent + git fields
-# ---------------------------------------------------------------------------
-
-WORKFLOW_AGENT_GIT = textwrap.dedent("""\
-    ---
-    agent:
-      max_retries: 5
-      retry_delay_s: 20
-      turn_timeout_s: 300
-      max_iterations: 10
-    git:
-      commit_after_each_task: false
-      commit_message_template: "chore: {task_title}"
-    ---
-    Custom system prompt.
-""")
+def test_run_shell_failure(tmp_path):
+    result = execute_run_shell("exit 1", tmp_path, timeout_s=10)
+    assert result.success is False
+    assert result.exit_code == 1
 
 
-def test_parse_workflow_agent_fields(tmp_path):
-    f = tmp_path / "WORKFLOW.md"
-    f.write_text(WORKFLOW_AGENT_GIT, encoding="utf-8")
-    cfg = parse_workflow(f)
-    assert cfg.max_retries == 5
-    assert cfg.retry_delay_s == 20.0
-    assert cfg.turn_timeout_s == 300
-    assert cfg.max_iterations == 10
+def test_run_shell_timeout(tmp_path):
+    result = execute_run_shell("sleep 10", tmp_path, timeout_s=1)
+    assert result.success is False
+    assert result.exit_code == -1
+    assert "timed out" in result.output.lower()
 
 
-def test_parse_workflow_git_fields(tmp_path):
-    f = tmp_path / "WORKFLOW.md"
-    f.write_text(WORKFLOW_AGENT_GIT, encoding="utf-8")
-    cfg = parse_workflow(f)
-    assert cfg.commit_after_each_task is False
-    assert cfg.commit_message_template == "chore: {task_title}"
-
-
-def test_parse_workflow_system_prompt(tmp_path):
-    f = tmp_path / "WORKFLOW.md"
-    f.write_text(WORKFLOW_AGENT_GIT, encoding="utf-8")
-    cfg = parse_workflow(f)
-    assert "Custom system prompt" in cfg.system_prompt
+def test_run_shell_output_format(tmp_path):
+    result = execute_run_shell("echo hello", tmp_path, timeout_s=10)
+    assert "exit_code:" in result.output
+    assert "stdout:" in result.output
+    assert "stderr:" in result.output
 
 
 # ---------------------------------------------------------------------------
-# parse_workflow — ollama + tools fields
+# execute_read_file
 # ---------------------------------------------------------------------------
 
-WORKFLOW_OLLAMA_TOOLS = textwrap.dedent("""\
-    ---
-    ollama:
-      hosts:
-        - http://host1:11434
-        - http://host2:11434
-      model: llama3.1:8b
-      timeout_s: 60
-      temperature: 0.5
-      context_window: 4096
-      num_ctx: 4096
-    tools:
-      enabled:
-        - run_shell
-        - read_file
-      shell_timeout_s: 15
-      working_dir: "/tmp/work"
-    ---
-    Ollama agent prompt.
-""")
+def test_read_file_existing(tmp_path):
+    f = tmp_path / "hello.txt"
+    f.write_text("hello world", encoding="utf-8")
+    result = execute_read_file("hello.txt", tmp_path)
+    assert result.success is True
+    assert "hello world" in result.output
 
 
-def test_parse_workflow_ollama_hosts(tmp_path):
-    f = tmp_path / "WORKFLOW.md"
-    f.write_text(WORKFLOW_OLLAMA_TOOLS, encoding="utf-8")
-    cfg = parse_workflow(f)
-    assert cfg.ollama_hosts == ["http://host1:11434", "http://host2:11434"]
+def test_read_file_not_found(tmp_path):
+    result = execute_read_file("missing.txt", tmp_path)
+    assert result.success is False
+    assert "not found" in result.output.lower()
 
 
-def test_parse_workflow_ollama_model(tmp_path):
-    f = tmp_path / "WORKFLOW.md"
-    f.write_text(WORKFLOW_OLLAMA_TOOLS, encoding="utf-8")
-    cfg = parse_workflow(f)
-    assert cfg.ollama_model == "llama3.1:8b"
+def test_read_file_traversal_blocked(tmp_path):
+    result = execute_read_file("../secret.txt", tmp_path)
+    assert result.success is False
+    assert "traversal" in result.output.lower() or "blocked" in result.output.lower()
 
 
-def test_parse_workflow_ollama_numerics(tmp_path):
-    f = tmp_path / "WORKFLOW.md"
-    f.write_text(WORKFLOW_OLLAMA_TOOLS, encoding="utf-8")
-    cfg = parse_workflow(f)
-    assert cfg.ollama_timeout_s == 60
-    assert cfg.ollama_temperature == 0.5
-    assert cfg.ollama_context_window == 4096
-    assert cfg.ollama_num_ctx == 4096
-
-
-def test_parse_workflow_tools_enabled(tmp_path):
-    f = tmp_path / "WORKFLOW.md"
-    f.write_text(WORKFLOW_OLLAMA_TOOLS, encoding="utf-8")
-    cfg = parse_workflow(f)
-    assert cfg.enabled_tools == ["run_shell", "read_file"]
-
-
-def test_parse_workflow_tools_shell_timeout(tmp_path):
-    f = tmp_path / "WORKFLOW.md"
-    f.write_text(WORKFLOW_OLLAMA_TOOLS, encoding="utf-8")
-    cfg = parse_workflow(f)
-    assert cfg.shell_timeout_s == 15
-    assert cfg.working_dir == "/tmp/work"
+def test_read_file_truncation(tmp_path):
+    f = tmp_path / "big.txt"
+    f.write_text("x" * 10000, encoding="utf-8")
+    result = execute_read_file("big.txt", tmp_path)
+    assert result.success is True
+    assert "truncated" in result.output
 
 
 # ---------------------------------------------------------------------------
-# StateStore
+# execute_write_file
 # ---------------------------------------------------------------------------
 
-def test_state_store_init(tmp_path):
-    store = StateStore(tmp_path / "state.json")
-    store.init_run("TASKS.md")
-    assert (tmp_path / "state.json").exists()
+def test_write_file_creates(tmp_path):
+    result = execute_write_file("new.txt", "content", tmp_path)
+    assert result.success is True
+    assert (tmp_path / "new.txt").read_text() == "content"
 
 
-def test_state_store_set_get(tmp_path):
-    store = StateStore(tmp_path / "state.json")
-    store.init_run("TASKS.md")
-    state = TaskState(status="completed", attempts=1, completed_at="2024-01-01T00:00:00+00:00")
-    store.set("my_task", state)
-    loaded = store.get("my_task")
-    assert loaded is not None
-    assert loaded.status == "completed"
-    assert loaded.attempts == 1
+def test_write_file_overwrites(tmp_path):
+    f = tmp_path / "existing.txt"
+    f.write_text("old content")
+    result = execute_write_file("existing.txt", "new content", tmp_path)
+    assert result.success is True
+    assert f.read_text() == "new content"
 
 
-def test_state_store_is_completed(tmp_path):
-    store = StateStore(tmp_path / "state.json")
-    store.init_run("TASKS.md")
-    assert store.is_completed("missing_task") is False
-    store.set("t1", TaskState(status="completed"))
-    assert store.is_completed("t1") is True
-    store.set("t2", TaskState(status="failed"))
-    assert store.is_completed("t2") is False
+def test_write_file_creates_parent_dirs(tmp_path):
+    result = execute_write_file("a/b/c/file.txt", "nested", tmp_path)
+    assert result.success is True
+    assert (tmp_path / "a" / "b" / "c" / "file.txt").exists()
 
 
-def test_state_store_resume(tmp_path):
-    """State persists across StateStore instances (simulates resume after restart)."""
-    state_file = tmp_path / "state.json"
-    store1 = StateStore(state_file)
-    store1.init_run("TASKS.md")
-    store1.set("task_one", TaskState(status="completed", attempts=1))
-
-    store2 = StateStore(state_file)
-    assert store2.is_completed("task_one") is True
+def test_write_file_traversal_blocked(tmp_path):
+    result = execute_write_file("../escape.txt", "bad", tmp_path)
+    assert result.success is False
+    assert "traversal" in result.output.lower() or "blocked" in result.output.lower()
 
 
-def test_state_store_unknown_slug_returns_none(tmp_path):
-    store = StateStore(tmp_path / "state.json")
-    store.init_run("TASKS.md")
-    assert store.get("nonexistent") is None
+# ---------------------------------------------------------------------------
+# execute_list_directory
+# ---------------------------------------------------------------------------
+
+def test_list_directory_existing(tmp_path):
+    (tmp_path / "file.txt").write_text("x")
+    (tmp_path / "subdir").mkdir()
+    result = execute_list_directory(".", tmp_path)
+    assert result.success is True
+    assert "file.txt" in result.output
+    assert "subdir" in result.output
 
 
-def test_state_store_corrupted_file(tmp_path):
-    """Corrupted state file should not crash — falls back to empty state."""
-    state_file = tmp_path / "state.json"
-    state_file.write_text("{ invalid json }", encoding="utf-8")
-    store = StateStore(state_file)  # should not raise
-    store.init_run("TASKS.md")
-    assert store.get("anything") is None
+def test_list_directory_empty(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    result = execute_list_directory("empty", tmp_path)
+    assert result.success is True
+    assert "empty" in result.output.lower()
+
+
+def test_list_directory_not_found(tmp_path):
+    result = execute_list_directory("nonexistent", tmp_path)
+    assert result.success is False
+
+
+def test_list_directory_default_path(tmp_path):
+    (tmp_path / "readme.md").write_text("x")
+    result = execute_list_directory("", tmp_path)
+    assert result.success is True
+    assert "readme.md" in result.output
+
+
+# ---------------------------------------------------------------------------
+# build_tool_schemas
+# ---------------------------------------------------------------------------
+
+def test_build_tool_schemas_task_complete_always_present():
+    cfg = WorkflowConfig(enabled_tools=[])
+    schemas = build_tool_schemas(cfg)
+    names = [s["function"]["name"] for s in schemas]
+    assert "task_complete" in names
+
+
+def test_build_tool_schemas_respects_enabled():
+    cfg = WorkflowConfig(enabled_tools=["run_shell", "read_file"])
+    schemas = build_tool_schemas(cfg)
+    names = [s["function"]["name"] for s in schemas]
+    assert "run_shell" in names
+    assert "read_file" in names
+    assert "write_file" not in names
+    assert "list_directory" not in names
+    assert "task_complete" in names
+
+
+def test_build_tool_schemas_no_duplicate_task_complete():
+    cfg = WorkflowConfig(enabled_tools=["task_complete"])
+    schemas = build_tool_schemas(cfg)
+    names = [s["function"]["name"] for s in schemas]
+    assert names.count("task_complete") == 1
+
+
+def test_build_tool_schemas_structure():
+    cfg = WorkflowConfig(enabled_tools=["run_shell"])
+    schemas = build_tool_schemas(cfg)
+    for schema in schemas:
+        assert "type" in schema
+        assert "function" in schema
+        assert "name" in schema["function"]
+        assert "parameters" in schema["function"]
+
+
+# ---------------------------------------------------------------------------
+# ToolExecutor
+# ---------------------------------------------------------------------------
+
+def test_tool_executor_run_shell(tmp_path):
+    cfg = WorkflowConfig(working_dir=str(tmp_path))
+    executor = ToolExecutor(cfg)
+    result = executor.execute(ToolCall(name="run_shell", arguments={"command": "echo hi"}))
+    assert result.success is True
+    assert "hi" in result.output
+
+
+def test_tool_executor_unknown_tool(tmp_path):
+    cfg = WorkflowConfig(working_dir=str(tmp_path))
+    executor = ToolExecutor(cfg)
+    result = executor.execute(ToolCall(name="nonexistent_tool", arguments={}))
+    assert result.success is False
+    assert "Unknown tool" in result.output
+
+
+def test_tool_executor_task_complete(tmp_path):
+    cfg = WorkflowConfig(working_dir=str(tmp_path))
+    executor = ToolExecutor(cfg)
+    result = executor.execute(ToolCall(name="task_complete", arguments={"summary": "done"}))
+    # task_complete is intercepted by the loop, but executor returns success
+    assert result.success is True
 ```
 
 ---
 
-## 7. `README.md`
-
-Crea un README con le seguenti sezioni:
-
-```markdown
-# Ollama Symphony
-
-A sequential task runner for local LLM models via Ollama.
-Reads development tasks from `TASKS.md`, executes them via a ReAct loop
-with tool calling, and commits results to git.
-
-Compatible with `symphony.py` task and state file formats.
-
-## Requirements
-
-- Python 3.11+
-- [Ollama](https://ollama.ai) running locally or on a remote host
-- `pip install -r requirements.txt`
-- A git repository (for auto-commit support)
-
-## Quick start
-
-    # 1. Start Ollama and pull a model
-    ollama pull qwen2.5-coder:7b
-
-    # 2. Install dependencies
-    pip install -r requirements.txt
-
-    # 3. Configure WORKFLOW.md and create TASKS.md
-
-    # 4. Run
-    python ollama_symphony.py
-
-## CLI options
-
-    --tasks FILE      Path to TASKS.md         (default: TASKS.md)
-    --workflow FILE   Path to WORKFLOW.md       (default: WORKFLOW.md)
-    --state FILE      Path to state file        (default: TASKS.state.json)
-    --reset           Ignore saved state, restart from task 1
-    --dry-run         Parse and log, do not invoke Ollama or git
-    --verbose / -v    Enable debug logging
-    --list-models     List models available on all configured Ollama hosts
-    --check           Validate config and Ollama connectivity, then exit
-
-## File formats
-
-### TASKS.md
-
-Each `##` heading defines one task. Format is identical to `symphony.py`.
-
-### WORKFLOW.md
-
-YAML front matter configures the runner. Markdown body is the system prompt.
-See the included `WORKFLOW.md` for all available options.
-
-## Differences from symphony.py
-
-`symphony.py` delegates execution to Claude Code, which has native agentic
-capabilities. `ollama_symphony.py` implements a ReAct loop: it sends prompts
-to Ollama and handles tool calls (shell, file I/O) locally.
-```
-
----
-
-## 8. Verifica finale
-
-Esegui i test e verifica che passino tutti:
+## 6. Verifica finale
 
 ```bash
-cd ollama_symphony
-pip install -r requirements.txt
-pytest tests/test_parsing.py -v
+pytest tests/test_tools.py -v
 ```
 
-Output atteso: tutti i test `PASSED`, nessun errore di import.
+Output atteso: tutti i test `PASSED`.
 
-Verifica anche che il modulo sia importabile senza errori:
+Verifica anche che il modulo sia ancora importabile senza errori dopo le aggiunte:
 
 ```bash
-python -c "from ollama_symphony import Task, WorkflowConfig, TaskState, StateStore, parse_tasks, parse_workflow; print('OK')"
+python -c "
+from ollama_symphony import (
+    _safe_path, execute_run_shell, execute_read_file,
+    execute_write_file, execute_list_directory,
+    build_tool_schemas, ToolExecutor
+)
+print('OK')
+"
 ```
 
 ---
 
 ## Criteri di completamento
 
-- [ ] `ollama_symphony.py` importabile senza errori
-- [ ] Tutti i dataclass presenti con i campi corretti
-- [ ] `parse_tasks` compatibile con i file `symphony.py` esistenti
-- [ ] `parse_workflow` gestisce tutti i campi `ollama` e `tools`
-- [ ] `StateStore` legge e scrive correttamente, regge il resume
-- [ ] `pytest tests/test_parsing.py -v` → tutti PASSED
-- [ ] `WORKFLOW.md`, `TASKS.md`, `README.md` creati
+- [ ] `_safe_path` blocca il path traversal con `ValueError`
+- [ ] Tutti e quattro i tool (`run_shell`, `read_file`, `write_file`, `list_directory`) implementati
+- [ ] `build_tool_schemas` include sempre `task_complete`
+- [ ] `ToolExecutor` gestisce tool sconosciuti senza crash
+- [ ] `pytest tests/test_tools.py -v` → tutti PASSED
+- [ ] `pytest tests/test_parsing.py -v` → ancora tutti PASSED (nessuna regressione)
