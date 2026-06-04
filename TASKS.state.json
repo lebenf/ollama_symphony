@@ -79,6 +79,18 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-04T15:24:37+00:00"
+    },
+    "CLI_options": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:25:56+00:00"
+    },
+    "File_formats": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:26:30+00:00"
     }
   }
 }
