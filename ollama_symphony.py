@@ -255,6 +255,452 @@ class StateStore:
 
 
 # ---------------------------------------------------------------------------
+# Tool definitions (Ollama function-calling format)
+# ---------------------------------------------------------------------------
+
+ALL_TOOL_DEFS: dict[str, dict] = {
+    "run_shell": {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": (
+                "Execute a shell command and return stdout + stderr. "
+                "Use for running tests, git commands, installing packages, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to execute"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    "read_file": {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path to the file"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    "write_file": {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file, creating it and any parent dirs if needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path to the file"},
+                    "content": {"type": "string", "description": "Content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    "list_directory": {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and directories at the given relative path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to list (default: '.')",
+                        "default": ".",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    "task_complete": {
+        "type": "function",
+        "function": {
+            "name": "task_complete",
+            "description": "Signal that the current task is complete. Call this when all work is done.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief summary of what was accomplished",
+                    },
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
+
+def _safe_path(path_str: str, working_dir: str) -> Path:
+    """Resolve path_str relative to working_dir; raise ValueError on traversal."""
+    base = Path(working_dir).resolve()
+    target = (base / path_str).resolve()
+    if target != base and not str(target).startswith(str(base) + os.sep):
+        raise ValueError(f"Path traversal blocked: {path_str!r} escapes working dir")
+    return target
+
+
+def execute_tool(
+    call: ToolCall,
+    config: "WorkflowConfig",
+    logger: logging.Logger,
+) -> ToolResult:
+    """Dispatch a ToolCall to the appropriate handler."""
+    name = call.name
+    args = call.arguments
+
+    if name == "run_shell":
+        return _tool_run_shell(args.get("command", ""), config, logger)
+    elif name == "read_file":
+        return _tool_read_file(args.get("path", ""), config)
+    elif name == "write_file":
+        return _tool_write_file(args.get("path", ""), args.get("content", ""), config)
+    elif name == "list_directory":
+        return _tool_list_directory(args.get("path", "."), config)
+    elif name == "task_complete":
+        return ToolResult(tool_name="task_complete", success=True, output=args.get("summary", ""))
+    else:
+        return ToolResult(tool_name=name, success=False, output=f"Unknown tool: {name}")
+
+
+def _tool_run_shell(command: str, config: "WorkflowConfig", logger: logging.Logger) -> ToolResult:
+    logger.debug("run_shell: %s", command)
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=config.shell_timeout_s,
+            cwd=config.working_dir,
+        )
+        output = result.stdout
+        if result.stderr:
+            output += "\n[stderr]\n" + result.stderr
+        return ToolResult(
+            tool_name="run_shell",
+            success=result.returncode == 0,
+            output=output.strip(),
+            exit_code=result.returncode,
+        )
+    except subprocess.TimeoutExpired:
+        return ToolResult(
+            tool_name="run_shell", success=False,
+            output=f"Command timed out after {config.shell_timeout_s}s",
+        )
+    except Exception as exc:
+        return ToolResult(tool_name="run_shell", success=False, output=str(exc))
+
+
+def _tool_read_file(path_str: str, config: "WorkflowConfig") -> ToolResult:
+    try:
+        safe = _safe_path(path_str, config.working_dir)
+        content = safe.read_text(encoding="utf-8")
+        return ToolResult(tool_name="read_file", success=True, output=content)
+    except ValueError as exc:
+        return ToolResult(tool_name="read_file", success=False, output=str(exc))
+    except FileNotFoundError:
+        return ToolResult(
+            tool_name="read_file", success=False, output=f"File not found: {path_str}",
+        )
+    except Exception as exc:
+        return ToolResult(tool_name="read_file", success=False, output=str(exc))
+
+
+def _tool_write_file(path_str: str, content: str, config: "WorkflowConfig") -> ToolResult:
+    try:
+        safe = _safe_path(path_str, config.working_dir)
+        safe.parent.mkdir(parents=True, exist_ok=True)
+        safe.write_text(content, encoding="utf-8")
+        return ToolResult(
+            tool_name="write_file", success=True,
+            output=f"Written {len(content)} chars to {path_str}",
+        )
+    except ValueError as exc:
+        return ToolResult(tool_name="write_file", success=False, output=str(exc))
+    except Exception as exc:
+        return ToolResult(tool_name="write_file", success=False, output=str(exc))
+
+
+def _tool_list_directory(path_str: str, config: "WorkflowConfig") -> ToolResult:
+    try:
+        safe = _safe_path(path_str or ".", config.working_dir)
+        entries = sorted(safe.iterdir(), key=lambda p: (p.is_file(), p.name))
+        lines = [f"{e.name}{'/' if e.is_dir() else ''}" for e in entries]
+        return ToolResult(tool_name="list_directory", success=True, output="\n".join(lines))
+    except ValueError as exc:
+        return ToolResult(tool_name="list_directory", success=False, output=str(exc))
+    except FileNotFoundError:
+        return ToolResult(
+            tool_name="list_directory", success=False, output=f"Directory not found: {path_str}",
+        )
+    except Exception as exc:
+        return ToolResult(tool_name="list_directory", success=False, output=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Prompt assembly (identical to symphony.py)
+# ---------------------------------------------------------------------------
+
+def build_prompt(
+    task: Task,
+    config: "WorkflowConfig",
+    completed_tasks: list[Task],
+) -> str:
+    """Compose the full prompt for one task, including completed-task context."""
+    parts: list[str] = [config.system_prompt.strip()]
+
+    if completed_tasks:
+        summary_lines = ["---", "## Previously completed tasks (already committed to git):", ""]
+        for t in completed_tasks:
+            summary_lines.append(f"- **{t.title}**")
+        summary_lines.append("")
+        summary_lines.append(
+            "These are already done. Do not redo them; focus only on the current task below."
+        )
+        parts.append("\n".join(summary_lines))
+
+    parts.append("---")
+    parts.append(f"## Current task: {task.title}")
+    parts.append("")
+    parts.append(task.body)
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Ollama ReAct loop
+# ---------------------------------------------------------------------------
+
+def _get_tool_defs(enabled: list[str]) -> list[dict]:
+    """Return Ollama tool-def dicts for the requested tool names."""
+    defs = [ALL_TOOL_DEFS[n] for n in enabled if n in ALL_TOOL_DEFS]
+    if "task_complete" not in enabled:
+        defs.append(ALL_TOOL_DEFS["task_complete"])
+    return defs
+
+
+def run_react_loop(
+    task: Task,
+    config: "WorkflowConfig",
+    prompt: str,
+    dry_run: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> tuple[bool, str]:
+    """
+    Run the ReAct loop for a single task via Ollama.
+    Returns (success, summary_or_error).
+    """
+    import ollama as _ollama
+
+    log = logger or logging.getLogger(__name__)
+
+    if dry_run:
+        log.info(
+            "[dry-run] Would run ReAct loop for task %r on %s",
+            task.title, config.ollama_hosts[0],
+        )
+        return True, "[dry-run] skipped"
+
+    messages: list[dict] = [{"role": "user", "content": prompt}]
+    tool_defs = _get_tool_defs(config.enabled_tools)
+    client = _ollama.Client(host=config.ollama_hosts[0])
+
+    for iteration in range(1, config.max_iterations + 1):
+        log.debug("react iteration=%d", iteration)
+
+        try:
+            response = client.chat(
+                model=config.ollama_model,
+                messages=messages,
+                tools=tool_defs,
+                options={
+                    "temperature": config.ollama_temperature,
+                    "num_ctx": config.ollama_num_ctx,
+                },
+            )
+        except Exception as exc:
+            return False, f"Ollama error: {exc}"
+
+        msg = response.message
+        messages.append({"role": "assistant", "content": msg.content or ""})
+
+        if not msg.tool_calls:
+            if iteration == config.max_iterations:
+                return False, f"Max iterations ({config.max_iterations}) reached without task_complete"
+            continue
+
+        task_done = False
+        completion_summary = ""
+
+        for tc in msg.tool_calls:
+            tool_name = tc.function.name
+            tool_args = dict(tc.function.arguments) if tc.function.arguments else {}
+
+            call = ToolCall(name=tool_name, arguments=tool_args)
+            log.info("tool_call=%s args=%s", tool_name, list(tool_args.keys()))
+
+            result = execute_tool(call, config, log)
+            log.debug(
+                "tool_result=%s success=%s output_len=%d",
+                result.tool_name, result.success, len(result.output),
+            )
+
+            messages.append({"role": "tool", "content": result.output})
+
+            if tool_name == "task_complete":
+                task_done = True
+                completion_summary = result.output
+
+        if task_done:
+            return True, completion_summary
+
+    return False, f"Max iterations ({config.max_iterations}) reached without task_complete"
+
+
+# ---------------------------------------------------------------------------
+# Git helpers (identical to symphony.py)
+# ---------------------------------------------------------------------------
+
+def git_commit(message: str, logger: logging.Logger) -> bool:
+    """Stage all changes and create a commit. Returns True on success."""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, check=True,
+        )
+        if not status.stdout.strip():
+            logger.info("git: nothing to commit, skipping")
+            return True
+
+        subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", message], check=True, capture_output=True)
+        logger.info("git: committed — %s", message)
+        return True
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode(errors="replace").strip() if exc.stderr else ""
+        logger.error("git commit failed: %s", stderr or exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+class OllamaSymphonyRunner:
+    def __init__(
+        self,
+        tasks: list[Task],
+        config: "WorkflowConfig",
+        state: StateStore,
+        dry_run: bool = False,
+    ):
+        self.tasks = tasks
+        self.config = config
+        self.state = state
+        self.dry_run = dry_run
+        self.log = logging.getLogger("ollama_symphony")
+
+    def run(self) -> bool:
+        """Execute all tasks in order. Returns True if all completed successfully."""
+        total = len(self.tasks)
+        self.log.info("Ollama Symphony start — %d task(s)", total)
+        completed_so_far: list[Task] = []
+
+        for task in self.tasks:
+            if self.state.is_completed(task.slug):
+                self.log.info(
+                    "task_status=skipped index=%d title=%r (already completed)",
+                    task.index + 1, task.title,
+                )
+                completed_so_far.append(task)
+                continue
+
+            success = self._run_task_with_retries(task, completed_so_far)
+
+            if success:
+                completed_so_far.append(task)
+            else:
+                self.log.error(
+                    "task_status=fatal index=%d title=%r — stopping run",
+                    task.index + 1, task.title,
+                )
+                return False
+
+        self.log.info("Ollama Symphony complete — all %d task(s) succeeded", total)
+        return True
+
+    def _run_task_with_retries(self, task: Task, completed_so_far: list[Task]) -> bool:
+        max_attempts = self.config.max_retries + 1
+        task_state = self.state.get(task.slug) or TaskState(status="pending")
+
+        for attempt in range(1, max_attempts + 1):
+            self.log.info(
+                "task_start index=%d title=%r attempt=%d/%d",
+                task.index + 1, task.title, attempt, max_attempts,
+            )
+
+            prompt = build_prompt(task, self.config, completed_so_far)
+            success, output = run_react_loop(
+                task, self.config, prompt,
+                dry_run=self.dry_run, logger=self.log,
+            )
+
+            task_state.attempts = attempt
+
+            if success:
+                if self.config.commit_after_each_task:
+                    commit_msg = self.config.commit_message_template.format(
+                        task_title=task.title,
+                        task_index=task.index + 1,
+                    )
+                    committed = git_commit(commit_msg, self.log) if not self.dry_run else True
+                    if not committed:
+                        self.log.warning("git commit failed for %r — continuing", task.title)
+
+                task_state.status = "completed"
+                task_state.error = None
+                task_state.completed_at = _now_iso()
+                self.state.set(task.slug, task_state)
+                self.log.info(
+                    "task_status=completed index=%d title=%r attempt=%d",
+                    task.index + 1, task.title, attempt,
+                )
+                return True
+
+            task_state.status = "failed"
+            task_state.error = output[:500]
+            self.state.set(task.slug, task_state)
+            self.log.warning(
+                "task_status=failed index=%d title=%r attempt=%d error=%r",
+                task.index + 1, task.title, attempt, output[:200],
+            )
+
+            if attempt < max_attempts:
+                self.log.info("Retrying in %.0fs…", self.config.retry_delay_s)
+                if not self.dry_run:
+                    time.sleep(self.config.retry_delay_s)
+
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -273,12 +719,112 @@ def setup_logging(verbose: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def list_models(config: "WorkflowConfig", logger: logging.Logger) -> None:
+    """Print all available models from all configured Ollama hosts."""
+    import ollama as _ollama
+    for host in config.ollama_hosts:
+        try:
+            client = _ollama.Client(host=host)
+            models = client.list()
+            logger.info("Host %s:", host)
+            for m in models.models:
+                logger.info("  %s", m.model)
+        except Exception as exc:
+            logger.error("Host %s: error — %s", host, exc)
+
+
+def check_connectivity(config: "WorkflowConfig", logger: logging.Logger) -> bool:
+    """Verify Ollama connectivity for all configured hosts."""
+    import ollama as _ollama
+    all_ok = True
+    for host in config.ollama_hosts:
+        try:
+            _ollama.Client(host=host).list()
+            logger.info("Host %s: OK", host)
+        except Exception as exc:
+            logger.error("Host %s: FAILED — %s", host, exc)
+            all_ok = False
+    return all_ok
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def main():
-    setup_logging()
-    logging.getLogger("ollama_symphony").info("ollama_symphony placeholder — run tasks 2-4 first")
+    parser = argparse.ArgumentParser(
+        description="Ollama Symphony — run tasks sequentially with a local Ollama model.",
+    )
+    parser.add_argument("--tasks", default="TASKS.md", metavar="FILE",
+                        help="Path to TASKS.md (default: TASKS.md)")
+    parser.add_argument("--workflow", default="WORKFLOW.md", metavar="FILE",
+                        help="Path to WORKFLOW.md (default: WORKFLOW.md)")
+    parser.add_argument("--state", default="TASKS.state.json", metavar="FILE",
+                        help="Path to state file (default: TASKS.state.json)")
+    parser.add_argument("--reset", action="store_true",
+                        help="Ignore saved state, restart from task 1")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Parse and log, do not invoke Ollama or git")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging")
+    parser.add_argument("--list-models", action="store_true",
+                        help="List models available on all configured Ollama hosts")
+    parser.add_argument("--check", action="store_true",
+                        help="Validate config and Ollama connectivity, then exit")
+    args = parser.parse_args()
+
+    setup_logging(args.verbose)
+    log = logging.getLogger("ollama_symphony")
+
+    config = WorkflowConfig()
+    workflow_path = Path(args.workflow)
+    if workflow_path.exists():
+        try:
+            config = parse_workflow(workflow_path)
+            log.info("Loaded workflow config from %s", workflow_path)
+        except Exception as exc:
+            log.error("Failed to parse %s: %s", workflow_path, exc)
+            sys.exit(1)
+    else:
+        log.info("No %s found — using defaults", workflow_path)
+
+    if args.list_models:
+        list_models(config, log)
+        sys.exit(0)
+
+    if args.check:
+        ok = check_connectivity(config, log)
+        sys.exit(0 if ok else 1)
+
+    tasks_path = Path(args.tasks)
+    if not tasks_path.exists():
+        log.error("Tasks file not found: %s", tasks_path)
+        sys.exit(1)
+
+    try:
+        tasks = parse_tasks(tasks_path)
+    except ValueError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
+    log.info("Loaded %d task(s) from %s", len(tasks), tasks_path)
+    for t in tasks:
+        log.debug("  [%d] %s", t.index + 1, t.title)
+
+    state_path = Path(args.state)
+    if args.reset and state_path.exists():
+        state_path.unlink()
+        log.info("State file reset")
+
+    state = StateStore(state_path)
+    state.init_run(str(tasks_path))
+
+    runner = OllamaSymphonyRunner(tasks, config, state, dry_run=args.dry_run)
+    success = runner.run()
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
