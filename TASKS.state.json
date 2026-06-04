@@ -7,6 +7,12 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-04T15:12:23+00:00"
+    },
+    "Struttura_da_creare": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:13:10+00:00"
     }
   }
 }
