@@ -13,6 +13,7 @@ from ollama_symphony import (
     _safe_path, execute_tool,
     _tool_read_file, _tool_write_file, _tool_run_shell, _tool_list_directory,
     build_prompt, run_react_loop, OllamaSymphonyRunner, StateStore,
+    build_tool_schemas, _TOOL_SCHEMAS,
 )
 
 _LOG = logging.getLogger("test")
@@ -310,3 +311,52 @@ def test_runner_multiple_tasks_dry_run(tmp_path):
     assert success is True
     assert state.is_completed("T1")
     assert state.is_completed("T2")
+
+
+# ---------------------------------------------------------------------------
+# build_tool_schemas
+# ---------------------------------------------------------------------------
+
+def test_build_tool_schemas_task_complete_always_present():
+    cfg = WorkflowConfig(enabled_tools=[])
+    schemas = build_tool_schemas(cfg)
+    names = [s["function"]["name"] for s in schemas]
+    assert "task_complete" in names
+
+
+def test_build_tool_schemas_task_complete_not_duplicated():
+    cfg = WorkflowConfig(enabled_tools=["task_complete"])
+    schemas = build_tool_schemas(cfg)
+    names = [s["function"]["name"] for s in schemas]
+    assert names.count("task_complete") == 1
+
+
+def test_build_tool_schemas_enabled_tools_included():
+    cfg = WorkflowConfig(enabled_tools=["run_shell", "read_file"])
+    schemas = build_tool_schemas(cfg)
+    names = [s["function"]["name"] for s in schemas]
+    assert "run_shell" in names
+    assert "read_file" in names
+
+
+def test_build_tool_schemas_unknown_tool_ignored():
+    cfg = WorkflowConfig(enabled_tools=["run_shell", "nonexistent_tool"])
+    schemas = build_tool_schemas(cfg)
+    names = [s["function"]["name"] for s in schemas]
+    assert "nonexistent_tool" not in names
+    assert "run_shell" in names
+
+
+def test_build_tool_schemas_structure():
+    cfg = WorkflowConfig(enabled_tools=["write_file"])
+    schemas = build_tool_schemas(cfg)
+    for schema in schemas:
+        assert schema["type"] == "function"
+        assert "function" in schema
+        assert "name" in schema["function"]
+        assert "parameters" in schema["function"]
+
+
+def test_tool_schemas_keys():
+    expected = {"run_shell", "read_file", "write_file", "list_directory", "task_complete"}
+    assert set(_TOOL_SCHEMAS.keys()) == expected

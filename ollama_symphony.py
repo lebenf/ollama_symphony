@@ -488,6 +488,122 @@ def build_prompt(
 
 
 # ---------------------------------------------------------------------------
+# Tool schemas (JSON format for Ollama)
+# ---------------------------------------------------------------------------
+
+_TOOL_SCHEMAS: dict[str, dict] = {
+    "run_shell": {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": (
+                "Execute a shell command in the working directory. "
+                "Use for running tests, installing packages, git commands, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute",
+                    }
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    "read_file": {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the content of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to working directory",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    "write_file": {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file, creating it or overwriting it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to working directory",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write to the file",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    "list_directory": {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and directories at a path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path relative to working directory (default: '.')",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    "task_complete": {
+        "type": "function",
+        "function": {
+            "name": "task_complete",
+            "description": (
+                "Call this when the task is fully completed and all tests pass. "
+                "This signals the runner that the task is done."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief description of what was implemented",
+                    }
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+}
+
+
+def build_tool_schemas(config: "WorkflowConfig") -> list[dict]:
+    """
+    Return the list of tool schemas to pass to Ollama.
+    Always includes task_complete regardless of config.enabled_tools.
+    """
+    schemas = []
+    for name in config.enabled_tools:
+        if name in _TOOL_SCHEMAS and name != "task_complete":
+            schemas.append(_TOOL_SCHEMAS[name])
+    schemas.append(_TOOL_SCHEMAS["task_complete"])
+    return schemas
+
+
+# ---------------------------------------------------------------------------
 # Ollama ReAct loop
 # ---------------------------------------------------------------------------
 
