@@ -67,6 +67,48 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-04T15:18:04+00:00"
+    },
+    "Requirements": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:18:35+00:00"
+    },
+    "Quick_start": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:24:21+00:00"
+    },
+    "CLI_options": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:24:21+00:00"
+    },
+    "File_formats": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:24:21+00:00"
+    },
+    "Differences_from_symphony.py": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:24:21+00:00"
+    },
+    "8._Verifica_finale": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:24:21+00:00"
+    },
+    "Criteri_di_completamento": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T15:24:21+00:00"
     }
   }
 }
