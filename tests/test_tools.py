@@ -12,6 +12,8 @@ from ollama_symphony import (
     Task, WorkflowConfig, TaskState, ToolCall,
     _safe_path, execute_tool,
     _tool_read_file, _tool_write_file, _tool_run_shell, _tool_list_directory,
+    execute_run_shell, execute_read_file, execute_write_file, execute_list_directory,
+    ToolExecutor,
     build_prompt, run_react_loop, OllamaSymphonyRunner, StateStore,
     build_tool_schemas, _TOOL_SCHEMAS,
 )
@@ -360,3 +362,74 @@ def test_build_tool_schemas_structure():
 def test_tool_schemas_keys():
     expected = {"run_shell", "read_file", "write_file", "list_directory", "task_complete"}
     assert set(_TOOL_SCHEMAS.keys()) == expected
+
+
+# ---------------------------------------------------------------------------
+# ToolExecutor
+# ---------------------------------------------------------------------------
+
+def test_tool_executor_read_file(tmp_path):
+    (tmp_path / "hello.txt").write_text("hello", encoding="utf-8")
+    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    result = executor.execute(ToolCall(name="read_file", arguments={"path": "hello.txt"}))
+    assert result.success is True
+    assert result.output == "hello"
+
+
+def test_tool_executor_write_file(tmp_path):
+    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    result = executor.execute(ToolCall(name="write_file", arguments={"path": "out.txt", "content": "data"}))
+    assert result.success is True
+    assert (tmp_path / "out.txt").read_text() == "data"
+
+
+def test_tool_executor_write_file_creates_dirs(tmp_path):
+    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    result = executor.execute(ToolCall(name="write_file", arguments={"path": "a/b/c.txt", "content": "x"}))
+    assert result.success is True
+    assert (tmp_path / "a" / "b" / "c.txt").read_text() == "x"
+
+
+def test_tool_executor_run_shell(tmp_path):
+    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    result = executor.execute(ToolCall(name="run_shell", arguments={"command": "echo hi"}))
+    assert result.success is True
+    assert "hi" in result.output
+
+
+def test_tool_executor_run_shell_failure(tmp_path):
+    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    result = executor.execute(ToolCall(name="run_shell", arguments={"command": "exit 2"}))
+    assert result.success is False
+    assert result.exit_code == 2
+
+
+def test_tool_executor_list_directory(tmp_path):
+    (tmp_path / "f.txt").write_text("x")
+    (tmp_path / "sub").mkdir()
+    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    result = executor.execute(ToolCall(name="list_directory", arguments={"path": "."}))
+    assert result.success is True
+    assert "f.txt" in result.output
+    assert "sub/" in result.output
+
+
+def test_tool_executor_task_complete(tmp_path):
+    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    result = executor.execute(ToolCall(name="task_complete", arguments={"summary": "done"}))
+    assert result.success is True
+    assert "task_complete" in result.output
+
+
+def test_tool_executor_unknown_tool(tmp_path):
+    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    result = executor.execute(ToolCall(name="no_such_tool", arguments={}))
+    assert result.success is False
+    assert "Unknown tool" in result.output
+
+
+def test_tool_executor_traversal_blocked(tmp_path):
+    executor = ToolExecutor(WorkflowConfig(working_dir=str(tmp_path)))
+    result = executor.execute(ToolCall(name="read_file", arguments={"path": "../../etc/passwd"}))
+    assert result.success is False
+    assert "traversal" in result.output.lower()

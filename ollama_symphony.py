@@ -347,6 +347,113 @@ ALL_TOOL_DEFS: dict[str, dict] = {
 # Tool execution
 # ---------------------------------------------------------------------------
 
+def execute_run_shell(command: str, working_dir: Path, timeout_s: int) -> ToolResult:
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            timeout=timeout_s, cwd=str(working_dir),
+        )
+        output = result.stdout
+        if result.stderr:
+            output += "\n[stderr]\n" + result.stderr
+        return ToolResult(
+            tool_name="run_shell",
+            success=result.returncode == 0,
+            output=output.strip(),
+            exit_code=result.returncode,
+        )
+    except subprocess.TimeoutExpired:
+        return ToolResult(
+            tool_name="run_shell", success=False,
+            output=f"Command timed out after {timeout_s}s",
+        )
+    except Exception as exc:
+        return ToolResult(tool_name="run_shell", success=False, output=str(exc))
+
+
+def execute_read_file(path_str: str, working_dir: Path) -> ToolResult:
+    try:
+        safe = _safe_path(working_dir, path_str)
+        content = safe.read_text(encoding="utf-8")
+        return ToolResult(tool_name="read_file", success=True, output=content)
+    except ValueError as exc:
+        return ToolResult(tool_name="read_file", success=False, output=str(exc))
+    except FileNotFoundError:
+        return ToolResult(
+            tool_name="read_file", success=False, output=f"File not found: {path_str}",
+        )
+    except Exception as exc:
+        return ToolResult(tool_name="read_file", success=False, output=str(exc))
+
+
+def execute_write_file(path_str: str, content: str, working_dir: Path) -> ToolResult:
+    try:
+        safe = _safe_path(working_dir, path_str)
+        safe.parent.mkdir(parents=True, exist_ok=True)
+        safe.write_text(content, encoding="utf-8")
+        return ToolResult(
+            tool_name="write_file", success=True,
+            output=f"Written {len(content)} chars to {path_str}",
+        )
+    except ValueError as exc:
+        return ToolResult(tool_name="write_file", success=False, output=str(exc))
+    except Exception as exc:
+        return ToolResult(tool_name="write_file", success=False, output=str(exc))
+
+
+def execute_list_directory(path_str: str, working_dir: Path) -> ToolResult:
+    try:
+        safe = _safe_path(working_dir, path_str or ".")
+        entries = sorted(safe.iterdir(), key=lambda p: (p.is_file(), p.name))
+        lines = [f"{e.name}{'/' if e.is_dir() else ''}" for e in entries]
+        return ToolResult(tool_name="list_directory", success=True, output="\n".join(lines))
+    except ValueError as exc:
+        return ToolResult(tool_name="list_directory", success=False, output=str(exc))
+    except FileNotFoundError:
+        return ToolResult(
+            tool_name="list_directory", success=False, output=f"Directory not found: {path_str}",
+        )
+    except Exception as exc:
+        return ToolResult(tool_name="list_directory", success=False, output=str(exc))
+
+
+class ToolExecutor:
+    """Dispatches tool calls to the appropriate implementation function."""
+
+    def __init__(self, config: WorkflowConfig):
+        self.config = config
+        self._working_dir = Path(config.working_dir).resolve()
+
+    def execute(self, tool_call: ToolCall) -> ToolResult:
+        """Execute a tool call and return the result."""
+        match tool_call.name:
+            case "run_shell":
+                command = tool_call.arguments.get("command", "")
+                return execute_run_shell(command, self._working_dir, self.config.shell_timeout_s)
+            case "read_file":
+                path = tool_call.arguments.get("path", "")
+                return execute_read_file(path, self._working_dir)
+            case "write_file":
+                path = tool_call.arguments.get("path", "")
+                content = tool_call.arguments.get("content", "")
+                return execute_write_file(path, content, self._working_dir)
+            case "list_directory":
+                path = tool_call.arguments.get("path", ".")
+                return execute_list_directory(path, self._working_dir)
+            case "task_complete":
+                return ToolResult(
+                    tool_name="task_complete",
+                    success=True,
+                    output="[task_complete signal — handled by runner]",
+                )
+            case _:
+                return ToolResult(
+                    tool_name=tool_call.name,
+                    success=False,
+                    output=f"Unknown tool: {tool_call.name!r}",
+                )
+
+
 def _safe_path(working_dir: Path, user_path: str) -> Path:
     """
     Resolve user_path relative to working_dir and verify it stays inside.
