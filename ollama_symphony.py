@@ -686,6 +686,45 @@ def build_prompt(
     return "\n\n".join(parts)
 
 
+def build_task_prompt(
+    task: "Task",
+    completed_tasks: list["Task"],
+    attempt: int,
+) -> str:
+    """Build the user-facing prompt for a single task."""
+    parts: list[str] = []
+
+    if completed_tasks:
+        parts.append("## Previously completed tasks (already committed):")
+        for t in completed_tasks:
+            parts.append(f"- {t.title}")
+        parts.append("Do not redo these. Focus only on the current task.\n")
+
+    if attempt > 1:
+        parts.append(
+            f"NOTE: This is retry attempt {attempt}. Previous attempt failed. "
+            "Review what might have gone wrong and try a different approach.\n"
+        )
+
+    parts.append(f"## Current task: {task.title}\n")
+    parts.append(task.body)
+
+    return "\n".join(parts)
+
+
+def build_initial_messages(
+    task: "Task",
+    completed_tasks: list["Task"],
+    system_prompt: str,
+    attempt: int,
+) -> list[dict]:
+    """Build the initial messages list for the ReAct loop."""
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": build_task_prompt(task, completed_tasks, attempt)},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas (JSON format for Ollama)
 # ---------------------------------------------------------------------------
