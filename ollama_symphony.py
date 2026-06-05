@@ -214,6 +214,58 @@ def parse_tasks(path: Path) -> list[Task]:
     return tasks
 
 
+def load_config(path: Path) -> WorkflowConfig:
+    """
+    Load WorkflowConfig from a plain YAML file (config.yml).
+    All sections are optional; missing keys fall back to WorkflowConfig defaults.
+    """
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    config = WorkflowConfig()
+
+    agent = data.get("agent", {})
+    if "max_retries" in agent:
+        config.max_retries = int(agent["max_retries"])
+    if "retry_delay_s" in agent:
+        config.retry_delay_s = float(agent["retry_delay_s"])
+    if "turn_timeout_s" in agent:
+        config.turn_timeout_s = int(agent["turn_timeout_s"])
+    if "max_iterations" in agent:
+        config.max_iterations = int(agent["max_iterations"])
+
+    git = data.get("git", {})
+    if "commit_after_each_task" in git:
+        config.commit_after_each_task = bool(git["commit_after_each_task"])
+    if "commit_message_template" in git:
+        config.commit_message_template = str(git["commit_message_template"])
+
+    ollama = data.get("ollama", {})
+    if "hosts" in ollama:
+        config.ollama_hosts = list(ollama["hosts"])
+    if "model" in ollama:
+        config.ollama_model = str(ollama["model"])
+    if "timeout_s" in ollama:
+        config.ollama_timeout_s = int(ollama["timeout_s"])
+    if "temperature" in ollama:
+        config.ollama_temperature = float(ollama["temperature"])
+    if "context_window" in ollama:
+        config.ollama_context_window = int(ollama["context_window"])
+    if "num_ctx" in ollama:
+        config.ollama_num_ctx = int(ollama["num_ctx"])
+
+    tools = data.get("tools", {})
+    if "enabled" in tools:
+        config.enabled_tools = list(tools["enabled"])
+    if "shell_timeout_s" in tools:
+        config.shell_timeout_s = int(tools["shell_timeout_s"])
+    if "working_dir" in tools:
+        config.working_dir = str(tools["working_dir"])
+
+    if "system_prompt" in data:
+        config.system_prompt = str(data["system_prompt"]).strip()
+
+    return config
+
+
 def parse_workflow(path: Path) -> WorkflowConfig:
     """
     Parse WORKFLOW.md with optional YAML front matter.
@@ -1299,8 +1351,10 @@ def main():
     )
     parser.add_argument("--tasks", default="TASKS.md", metavar="FILE",
                         help="Path to TASKS.md (default: TASKS.md)")
+    parser.add_argument("--config", default="config.yml", metavar="FILE",
+                        help="Path to YAML config file (default: config.yml)")
     parser.add_argument("--workflow", default="WORKFLOW.md", metavar="FILE",
-                        help="Path to WORKFLOW.md (default: WORKFLOW.md)")
+                        help="Path to WORKFLOW.md legacy config (default: WORKFLOW.md)")
     parser.add_argument("--state", default="TASKS.state.json", metavar="FILE",
                         help="Path to state file (default: TASKS.state.json)")
     parser.add_argument("--reset", action="store_true",
@@ -1319,8 +1373,16 @@ def main():
     log = logging.getLogger("ollama_symphony")
 
     config = WorkflowConfig()
+    config_path = Path(args.config)
     workflow_path = Path(args.workflow)
-    if workflow_path.exists():
+    if config_path.exists():
+        try:
+            config = load_config(config_path)
+            log.info("Loaded config from %s", config_path)
+        except Exception as exc:
+            log.error("Failed to parse %s: %s", config_path, exc)
+            sys.exit(1)
+    elif workflow_path.exists():
         try:
             config = parse_workflow(workflow_path)
             log.info("Loaded workflow config from %s", workflow_path)
@@ -1328,7 +1390,7 @@ def main():
             log.error("Failed to parse %s: %s", workflow_path, exc)
             sys.exit(1)
     else:
-        log.info("No %s found — using defaults", workflow_path)
+        log.info("No config file found — using defaults")
 
     if args.list_models:
         list_models(config, log)

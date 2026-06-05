@@ -1,0 +1,60 @@
+# Ollama Symphony — sample configuration
+# Copy to config.yml and adjust as needed.
+
+agent:
+  # Number of retries on task failure (excluding first attempt)
+  max_retries: 3
+  # Seconds to wait between retries
+  retry_delay_s: 10.0
+  # Seconds before a single Ollama turn is considered timed out
+  turn_timeout_s: 600
+  # Max ReAct iterations per task before giving up
+  max_iterations: 20
+
+git:
+  # Create a git commit after each task completes
+  commit_after_each_task: true
+  # Commit message template — supports {task_title} and {task_index}
+  commit_message_template: "feat: {task_title}"
+
+ollama:
+  # One or more Ollama host URLs — round-robin on failure
+  hosts:
+    - http://localhost:11434
+    # - http://second-host:11434
+  # Model to use — must be pulled on the host(s)
+  model: qwen2.5-coder:7b
+  # HTTP timeout in seconds for each Ollama request
+  timeout_s: 120
+  # Sampling temperature (0.0 = deterministic, 1.0 = creative)
+  temperature: 0.2
+  # Context window size used for truncation decisions
+  context_window: 8192
+  # num_ctx passed directly to Ollama options
+  num_ctx: 8192
+
+tools:
+  # Tools the agent is allowed to call
+  # Available: run_shell, read_file, write_file, list_directory
+  # task_complete is always enabled and does not need to be listed
+  enabled:
+    - run_shell
+    - read_file
+    - write_file
+    - list_directory
+  # Timeout in seconds for each shell command
+  shell_timeout_s: 30
+  # Working directory for shell commands and file operations
+  working_dir: .
+
+# System prompt sent to the model before each task.
+# Use the | block scalar to preserve newlines.
+system_prompt: |
+  You are an autonomous development agent working on a software project.
+  For each task assigned to you:
+  1. Read the task description carefully.
+  2. Implement the required code changes using the available tools.
+  3. Write the tests specified in the task.
+  4. Run the test suite and iterate until all tests pass.
+  5. Do not ask for confirmation — proceed autonomously.
+  6. When the task is complete, call the `task_complete` tool with a brief summary.

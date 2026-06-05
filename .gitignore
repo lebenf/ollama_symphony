@@ -47,3 +47,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+config.yml
+TASKS.state.json
