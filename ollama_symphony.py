@@ -803,6 +803,167 @@ def build_tool_schemas(config: "WorkflowConfig") -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# ReAct loop
+# ---------------------------------------------------------------------------
+
+class ReactLoop:
+    """
+    Implements the Reason+Act loop for a single task.
+
+    Sends messages to Ollama, intercepts tool_calls, executes them via
+    ToolExecutor, and feeds results back until task_complete is called
+    or max_iterations is reached.
+    """
+
+    def __init__(
+        self,
+        client: OllamaClient,
+        executor: ToolExecutor,
+        config: WorkflowConfig,
+    ):
+        self._client = client
+        self._executor = executor
+        self._config = config
+        self._log = logging.getLogger("ollama_symphony.react")
+
+    def run(self, messages: list[dict], tools: list[dict]) -> tuple[bool, str]:
+        """
+        Execute the ReAct loop.
+        Returns (success: bool, summary_or_error: str).
+        """
+        for iteration in range(1, self._config.max_iterations + 1):
+            if self._should_truncate(messages):
+                messages = self._truncate_context(messages)
+                self._log.warning("context_truncated iteration=%d", iteration)
+
+            try:
+                response = self._client.chat(messages, tools)
+            except OllamaConnectionError as exc:
+                return False, f"Ollama unreachable: {exc}"
+            except Exception as exc:
+                return False, f"Ollama error: {exc}"
+
+            msg = self._extract_message(response)
+            tool_calls = self._extract_tool_calls(msg)
+
+            self._log.debug(
+                "react_iteration=%d tool_calls=%d", iteration, len(tool_calls)
+            )
+
+            if not tool_calls:
+                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                self._log.warning(
+                    "react_no_tool_calls iteration=%d — treating as implicit completion",
+                    iteration,
+                )
+                return True, content[:300] if content else "completed (no summary)"
+
+            task_done = False
+            task_summary = ""
+            for tc_raw in tool_calls:
+                tool_call = self._parse_tool_call(tc_raw)
+
+                if tool_call.name == "task_complete":
+                    task_summary = tool_call.arguments.get("summary", "")
+                    self._log.info("task_complete summary=%r", task_summary)
+                    task_done = True
+                    messages = self._append_assistant_turn(messages, msg)
+                    messages = self._append_tool_result(
+                        messages,
+                        tool_call.name,
+                        ToolResult(tool_name="task_complete", success=True, output="acknowledged"),
+                    )
+                    break
+
+                result = self._executor.execute(tool_call)
+                self._log.debug(
+                    "tool_exec name=%s success=%s exit_code=%s",
+                    tool_call.name,
+                    result.success,
+                    result.exit_code,
+                )
+
+                messages = self._append_assistant_turn(messages, msg)
+                messages = self._append_tool_result(messages, tool_call.name, result)
+
+            if task_done:
+                return True, task_summary
+
+        return False, f"max_iterations ({self._config.max_iterations}) reached without task_complete"
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _extract_message(self, response: dict) -> dict:
+        """Extract the assistant message dict from the Ollama response."""
+        if isinstance(response, dict):
+            msg = response.get("message", {})
+            if isinstance(msg, dict):
+                return msg
+            if hasattr(msg, "__dict__"):
+                return vars(msg)
+        return {}
+
+    def _extract_tool_calls(self, message: dict) -> list:
+        """Extract tool_calls list from the message dict."""
+        tc = message.get("tool_calls")
+        if tc is None:
+            return []
+        if isinstance(tc, list):
+            return tc
+        return []
+
+    def _parse_tool_call(self, tc_raw) -> ToolCall:
+        """Normalize a raw tool_call entry (dict or object) into ToolCall."""
+        if isinstance(tc_raw, dict):
+            fn = tc_raw.get("function", {})
+            name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+            args = fn.get("arguments", {}) if isinstance(fn, dict) else getattr(fn, "arguments", {})
+        else:
+            fn = getattr(tc_raw, "function", None)
+            name = getattr(fn, "name", "") if fn else ""
+            args = getattr(fn, "arguments", {}) if fn else {}
+
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+
+        return ToolCall(name=name, arguments=args or {})
+
+    def _append_assistant_turn(self, messages: list[dict], msg: dict) -> list[dict]:
+        """Append the assistant message to the conversation history."""
+        return messages + [{"role": "assistant", **msg}]
+
+    def _append_tool_result(
+        self, messages: list[dict], tool_name: str, result: ToolResult
+    ) -> list[dict]:
+        """Append a tool result message to the conversation history."""
+        return messages + [{"role": "tool", "content": self._format_tool_result(result)}]
+
+    def _format_tool_result(self, result: ToolResult) -> str:
+        status = "success" if result.success else "error"
+        return f"[{result.tool_name}] {status}\n{result.output}"
+
+    def _estimate_tokens(self, messages: list[dict]) -> int:
+        """Rough token estimate: characters / 4."""
+        return len(json.dumps(messages, ensure_ascii=False)) // 4
+
+    def _should_truncate(self, messages: list[dict]) -> bool:
+        return self._estimate_tokens(messages) > int(self._config.ollama_context_window * 0.85)
+
+    def _truncate_context(self, messages: list[dict]) -> list[dict]:
+        """Keep: system message (index 0) + first user message (index 1) + last 6 messages."""
+        if len(messages) <= 8:
+            return messages
+        head = messages[:2]
+        tail = messages[-6:]
+        return head + tail
+
+
+# ---------------------------------------------------------------------------
 # Ollama ReAct loop
 # ---------------------------------------------------------------------------
 
