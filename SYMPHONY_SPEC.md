@@ -137,6 +137,30 @@ that the model does not need to make architectural decisions on its own.
 
 7. **Markdown is welcome** for readability (lists, inline code, code blocks).
 
+8. **Anchor test fixtures to the existing implementation, not to assumed structures.**
+   When a test task creates files on disk, mocks DB cursor rows, or replicates any
+   structure already defined in source code, instruct the model to read the relevant
+   source module first and derive the exact structure from it.
+
+   Use this pattern in the task body:
+
+   > Read `src/foo/bar.py` first. Derive the exact file path / column order / output
+   > format from the actual implementation, then build test fixtures that match it.
+
+   Without this instruction, the model will invent a structure that looks plausible
+   but silently diverges from the real code — causing tests to fail with confusing
+   errors (wrong path, wrong key order, wrong format) that neither the model nor the
+   logs make immediately obvious.
+
+   **Common cases and what to anchor to:**
+
+   | Test creates | Read this first |
+   |---|---|
+   | Files on disk with `tmp_path` | Module containing the path-building function (e.g. `get_media_path`) |
+   | Mock DB cursor rows | Module containing the actual `SELECT` query (column order matters) |
+   | Comparison of serialized output | Module containing the serializer / formatter |
+   | Mock HTTP responses | Module containing the actual request and expected response shape |
+
 ### Tools available to the model
 
 The model can only use these tools during each task:
@@ -373,6 +397,8 @@ Before delivering `TASKS.md` (and `config.yml` / `WORKFLOW.md`) verify:
 - [ ] Every task specifies the files to create or modify (when known)
 - [ ] Every task includes explicit instructions on how to run tests and when to consider them passed
 - [ ] Any task combining complex implementation with mock tests is split into two tasks
+- [ ] Test tasks that create files on disk or mock DB rows instruct the model to read
+  the relevant source module first and derive the exact structure from it (rule 8)
 - [ ] No task body exceeds ~25 lines (with `num_ctx: 8192`) or ~40 lines (with `num_ctx: 16384`)
 - [ ] Tasks are ordered so each can run with the code from previous tasks already committed
 - [ ] No task is ambiguous enough to require an undocumented architectural decision
