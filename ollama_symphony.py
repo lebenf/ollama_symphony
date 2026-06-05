@@ -1125,7 +1125,7 @@ class OllamaSymphonyRunner:
     def __init__(
         self,
         tasks: list[Task],
-        config: "WorkflowConfig",
+        config: WorkflowConfig,
         state: StateStore,
         dry_run: bool = False,
     ):
@@ -1134,11 +1134,16 @@ class OllamaSymphonyRunner:
         self.state = state
         self.dry_run = dry_run
         self.log = logging.getLogger("ollama_symphony")
+        self._client = OllamaClient(config)
+        self._executor = ToolExecutor(config)
 
     def run(self) -> bool:
-        """Execute all tasks in order. Returns True if all completed successfully."""
         total = len(self.tasks)
-        self.log.info("Ollama Symphony start — %d task(s)", total)
+        self.log.info(
+            "Symphony start — %d task(s) to process  hosts=%s model=%s",
+            total, self.config.ollama_hosts, self.config.ollama_model,
+        )
+
         completed_so_far: list[Task] = []
 
         for task in self.tasks:
@@ -1161,7 +1166,7 @@ class OllamaSymphonyRunner:
                 )
                 return False
 
-        self.log.info("Ollama Symphony complete — all %d task(s) succeeded", total)
+        self.log.info("Symphony complete — all %d task(s) succeeded", total)
         return True
 
     def _run_task_with_retries(self, task: Task, completed_so_far: list[Task]) -> bool:
@@ -1174,12 +1179,9 @@ class OllamaSymphonyRunner:
                 task.index + 1, task.title, attempt, max_attempts,
             )
 
-            prompt = build_prompt(task, self.config, completed_so_far)
-            success, output = run_react_loop(
-                task, self.config, prompt,
-                dry_run=self.dry_run, logger=self.log,
+            success, summary_or_error = self._run_single_attempt(
+                task, completed_so_far, attempt
             )
-
             task_state.attempts = attempt
 
             if success:
@@ -1188,14 +1190,18 @@ class OllamaSymphonyRunner:
                         task_title=task.title,
                         task_index=task.index + 1,
                     )
-                    committed = git_commit(commit_msg, self.log) if not self.dry_run else True
-                    if not committed:
-                        self.log.warning("git commit failed for %r — continuing", task.title)
+                    if not self.dry_run:
+                        committed = git_commit(commit_msg, self.log)
+                        if not committed:
+                            self.log.warning(
+                                "git commit failed for task %r — continuing", task.title
+                            )
 
                 task_state.status = "completed"
                 task_state.error = None
                 task_state.completed_at = _now_iso()
                 self.state.set(task.slug, task_state)
+
                 self.log.info(
                     "task_status=completed index=%d title=%r attempt=%d",
                     task.index + 1, task.title, attempt,
@@ -1203,11 +1209,12 @@ class OllamaSymphonyRunner:
                 return True
 
             task_state.status = "failed"
-            task_state.error = output[:500]
+            task_state.error = summary_or_error[:500]
             self.state.set(task.slug, task_state)
+
             self.log.warning(
                 "task_status=failed index=%d title=%r attempt=%d error=%r",
-                task.index + 1, task.title, attempt, output[:200],
+                task.index + 1, task.title, attempt, summary_or_error[:200],
             )
 
             if attempt < max_attempts:
@@ -1216,6 +1223,20 @@ class OllamaSymphonyRunner:
                     time.sleep(self.config.retry_delay_s)
 
         return False
+
+    def _run_single_attempt(
+        self, task: Task, completed_so_far: list[Task], attempt: int
+    ) -> tuple[bool, str]:
+        if self.dry_run:
+            self.log.info("[dry-run] Would run task %r via Ollama ReAct loop", task.title)
+            return True, "[dry-run]"
+
+        messages = build_initial_messages(
+            task, completed_so_far, self.config.system_prompt, attempt
+        )
+        tools = build_tool_schemas(self.config)
+        loop = ReactLoop(self._client, self._executor, self.config)
+        return loop.run(messages, tools)
 
 
 # ---------------------------------------------------------------------------
