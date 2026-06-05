@@ -43,6 +43,12 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-04T20:10:41+00:00"
+    },
+    "Criteri_di_completamento": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-04T20:10:55+00:00"
     }
   }
 }
