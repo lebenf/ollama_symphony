@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Lorenzo Benfenati
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Tests for parse_tasks, parse_workflow, _slugify, and StateStore."""
 
 import json
