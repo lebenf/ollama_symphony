@@ -53,3 +53,65 @@ See the included `WORKFLOW.md` for all available options.
 `symphony.py` delegates execution to Claude Code, which has native agentic
 capabilities. `ollama_symphony.py` implements a ReAct loop: it sends prompts
 to Ollama and handles tool calls (shell, file I/O) locally.
+
+Key differences:
+
+| Feature | symphony.py | ollama_symphony.py |
+|---|---|---|
+| Model | Claude (Anthropic API) | Any Ollama model |
+| Tool execution | Claude Code built-ins | Local Python handlers |
+| Cost | API credits | Local compute |
+| State format | TASKS.state.json | Same — compatible |
+
+## Multi-host Ollama
+
+Configure multiple Ollama hosts in `WORKFLOW.md` front matter:
+
+```yaml
+ollama_hosts:
+  - http://gpu1.local:11434
+  - http://gpu2.local:11434
+  - http://localhost:11434
+```
+
+The runner uses round-robin across hosts and automatically falls back to the
+next host if a request fails. If all hosts fail, the task is retried up to
+`max_retries` times.
+
+## Modelli consigliati
+
+| Model | Size | Notes |
+|---|---|---|
+| `qwen2.5-coder:7b` | 4 GB | Default. Good balance of speed and quality |
+| `qwen2.5-coder:14b` | 8 GB | Better reasoning, slower |
+| `deepseek-coder-v2:16b` | 9 GB | Strong at code generation |
+| `llama3.1:8b` | 5 GB | General purpose, good instruction following |
+| `codellama:13b` | 8 GB | Specialized for code, older architecture |
+
+Set the model in `WORKFLOW.md`:
+
+```yaml
+ollama_model: qwen2.5-coder:7b
+```
+
+## Tool disponibili
+
+| Tool | Enabled by default | Description |
+|---|---|---|
+| `run_shell` | yes | Execute a shell command in the working directory |
+| `read_file` | yes | Read a file relative to the working directory |
+| `write_file` | yes | Write or overwrite a file |
+| `list_directory` | yes | List entries in a directory |
+| `task_complete` | always | Signal task completion with a summary (always active) |
+
+Enable or disable tools in `WORKFLOW.md`:
+
+```yaml
+tools:
+  enabled:
+    - run_shell
+    - read_file
+    - write_file
+    - list_directory
+  shell_timeout_s: 60
+```

@@ -91,6 +91,18 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-05T05:41:30+00:00"
+    },
+    "8._Test_suite": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-05T05:42:34+00:00"
+    },
+    "9._Verifica_finale": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-05T05:42:58+00:00"
     }
   }
 }
