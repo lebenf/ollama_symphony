@@ -112,6 +112,80 @@ class OllamaConnectionError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Ollama client with round-robin host rotation
+# ---------------------------------------------------------------------------
+
+class OllamaClient:
+    """
+    Wraps the ollama Python client with round-robin across multiple hosts.
+    Falls back to the next host on ConnectionError or timeout.
+    """
+
+    def __init__(self, config: WorkflowConfig):
+        self._hosts = config.ollama_hosts
+        self._model = config.ollama_model
+        self._config = config
+        self._current_host_idx = 0
+        self._log = logging.getLogger("ollama_symphony.client")
+
+    def _next_host(self) -> str:
+        host = self._hosts[self._current_host_idx]
+        self._current_host_idx = (self._current_host_idx + 1) % len(self._hosts)
+        return host
+
+    def chat(self, messages: list[dict], tools: list[dict]) -> dict:
+        """
+        Call Ollama /api/chat with tool calling.
+        Tries each host in rotation; raises OllamaConnectionError if all fail.
+        Returns the raw response dict from the ollama library.
+        """
+        import ollama
+
+        last_exc: Exception | None = None
+        for _ in range(len(self._hosts)):
+            host = self._next_host()
+            try:
+                self._log.debug("ollama_request host=%s model=%s", host, self._model)
+                client = ollama.Client(host=host)
+                response = client.chat(
+                    model=self._model,
+                    messages=messages,
+                    tools=tools,
+                    stream=False,
+                    options={
+                        "temperature": self._config.ollama_temperature,
+                        "num_ctx": self._config.ollama_num_ctx,
+                    },
+                )
+                # ollama library returns an object; convert to dict for uniform handling
+                if hasattr(response, "model_dump"):
+                    return response.model_dump()
+                if hasattr(response, "__dict__"):
+                    return dict(response)
+                return response  # type: ignore
+            except Exception as exc:
+                self._log.warning("ollama_host_error host=%s error=%r", host, str(exc))
+                last_exc = exc
+
+        raise OllamaConnectionError(
+            f"All Ollama hosts unreachable: {self._hosts}. Last error: {last_exc}"
+        )
+
+    def list_models(self) -> list[str]:
+        """List models available on the current host."""
+        import ollama
+        host = self._hosts[self._current_host_idx]
+        try:
+            client = ollama.Client(host=host)
+            response = client.list()
+            models = response.get("models", []) if isinstance(response, dict) else []
+            return [m.get("name", "") for m in models if m.get("name")]
+        except Exception as exc:
+            self._log.warning("list_models failed host=%s error=%r", host, str(exc))
+            return []
+
+
+# ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
