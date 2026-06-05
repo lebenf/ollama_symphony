@@ -55,6 +55,12 @@
       "attempts": 1,
       "error": null,
       "completed_at": "2026-06-05T05:32:23+00:00"
+    },
+    "2.__OllamaClient": {
+      "status": "completed",
+      "attempts": 1,
+      "error": null,
+      "completed_at": "2026-06-05T05:33:43+00:00"
     }
   }
 }
