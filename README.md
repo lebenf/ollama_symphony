@@ -4,8 +4,6 @@ A sequential task runner for local LLM models via Ollama.
 Reads development tasks from `TASKS.md`, executes them via a ReAct loop
 with tool calling, and commits results to git.
 
-Compatible with `symphony.py` task and state file formats.
-
 ## Requirements
 
 - Python 3.11+
@@ -21,64 +19,82 @@ Compatible with `symphony.py` task and state file formats.
     # 2. Install dependencies
     pip install -r requirements.txt
 
-    # 3. Configure WORKFLOW.md and create TASKS.md
+    # 3. Create config.yml and TASKS.md (see SYMPHONY_SPEC.md)
 
     # 4. Run
     python ollama_symphony.py
 
 ## CLI options
 
-    --tasks FILE      Path to TASKS.md         (default: TASKS.md)
-    --workflow FILE   Path to WORKFLOW.md       (default: WORKFLOW.md)
-    --state FILE      Path to state file        (default: TASKS.state.json)
+    --tasks FILE      Path to TASKS.md             (default: TASKS.md)
+    --config FILE     Path to config.yml            (default: config.yml)
+    --workflow FILE   Path to WORKFLOW.md (legacy)  (default: WORKFLOW.md)
+    --state FILE      Path to state file            (default: TASKS.state.json)
     --reset           Ignore saved state, restart from task 1
     --dry-run         Parse and log, do not invoke Ollama or git
     --verbose / -v    Enable debug logging
     --list-models     List models available on all configured Ollama hosts
     --check           Validate config and Ollama connectivity, then exit
 
-## File formats
+## Configuration
 
-### TASKS.md
+The runner loads configuration in this order: `config.yml` → `WORKFLOW.md` → built-in defaults.
 
-Each `##` heading defines one task. Format is identical to `symphony.py`.
+### config.yml (recommended)
 
-### WORKFLOW.md
+```yaml
+agent:
+  max_retries: 3
+  max_iterations: 20
 
-YAML front matter configures the runner. Markdown body is the system prompt.
-See the included `WORKFLOW.md` for all available options.
+ollama:
+  hosts:
+    - http://localhost:11434
+  model: qwen2.5-coder:7b
+  num_ctx: 16384
+  context_window: 16384
+  temperature: 0.2
 
-## Differences from symphony.py
+tools:
+  shell_timeout_s: 30
+  working_dir: "."
 
-`symphony.py` delegates execution to Claude Code, which has native agentic
-capabilities. `ollama_symphony.py` implements a ReAct loop: it sends prompts
-to Ollama and handles tool calls (shell, file I/O) locally.
+system_prompt: |
+  You are an autonomous development agent...
+```
 
-Key differences:
+### WORKFLOW.md (legacy format)
 
-| Feature | symphony.py | ollama_symphony.py |
-|---|---|---|
-| Model | Claude (Anthropic API) | Any Ollama model |
-| Tool execution | Claude Code built-ins | Local Python handlers |
-| Cost | API credits | Local compute |
-| State format | TASKS.state.json | Same — compatible |
+YAML front matter configures the runner; the Markdown body becomes the system prompt.
+
+```
+---
+ollama:
+  model: qwen2.5-coder:14b
+  num_ctx: 16384
+  context_window: 16384
+---
+You are an autonomous development agent...
+```
+
+See `SYMPHONY_SPEC.md` for the full reference on all parameters and task authoring guidelines.
 
 ## Multi-host Ollama
 
-Configure multiple Ollama hosts in `WORKFLOW.md` front matter:
+Configure multiple Ollama hosts for round-robin load balancing:
 
 ```yaml
-ollama_hosts:
-  - http://gpu1.local:11434
-  - http://gpu2.local:11434
-  - http://localhost:11434
+ollama:
+  hosts:
+    - http://gpu1.local:11434
+    - http://gpu2.local:11434
+    - http://localhost:11434
 ```
 
-The runner uses round-robin across hosts and automatically falls back to the
-next host if a request fails. If all hosts fail, the task is retried up to
-`max_retries` times.
+The runner automatically falls back to the next host on failure. If all hosts fail,
+the task is retried up to `max_retries` times.
 
-## Modelli consigliati
+## Recommended models
 
 | Model | Size | Notes |
 |---|---|---|
@@ -86,15 +102,15 @@ next host if a request fails. If all hosts fail, the task is retried up to
 | `qwen2.5-coder:14b` | 8 GB | Better reasoning, slower |
 | `deepseek-coder-v2:16b` | 9 GB | Strong at code generation |
 | `llama3.1:8b` | 5 GB | General purpose, good instruction following |
-| `codellama:13b` | 8 GB | Specialized for code, older architecture |
 
-Set the model in `WORKFLOW.md`:
+Set the model in `config.yml`:
 
 ```yaml
-ollama_model: qwen2.5-coder:7b
+ollama:
+  model: qwen2.5-coder:7b
 ```
 
-## Tool disponibili
+## Available tools
 
 | Tool | Enabled by default | Description |
 |---|---|---|
@@ -102,9 +118,9 @@ ollama_model: qwen2.5-coder:7b
 | `read_file` | yes | Read a file relative to the working directory |
 | `write_file` | yes | Write or overwrite a file |
 | `list_directory` | yes | List entries in a directory |
-| `task_complete` | always | Signal task completion with a summary (always active) |
+| `task_complete` | always | Signal task completion (always active) |
 
-Enable or disable tools in `WORKFLOW.md`:
+Enable or disable tools in `config.yml`:
 
 ```yaml
 tools:
