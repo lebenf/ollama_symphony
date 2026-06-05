@@ -12,10 +12,13 @@ from ollama_symphony import (
     OllamaClient,
     OllamaConnectionError,
     ReactLoop,
+    Task,
     ToolCall,
     ToolExecutor,
     ToolResult,
     WorkflowConfig,
+    build_task_prompt,
+    build_initial_messages,
 )
 
 
@@ -397,3 +400,54 @@ def test_run_triggers_truncation_when_context_large():
     success, summary = loop.run(msgs, tools=[])
 
     assert success is True
+
+
+# ---------------------------------------------------------------------------
+# run() — unknown tool continues loop
+# ---------------------------------------------------------------------------
+
+def test_run_unknown_tool_continues(tmp_path):
+    config = WorkflowConfig(working_dir=str(tmp_path), max_iterations=5)
+    client = MagicMock(spec=OllamaClient)
+    client.chat.side_effect = [
+        _response(tool_calls=[_tc_dict("nonexistent_tool", arg="x")]),
+        _response(tool_calls=[_tc_dict("task_complete", summary="recovered")]),
+    ]
+    executor = ToolExecutor(config)
+    loop = ReactLoop(client, executor, config)
+
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+    success, summary = loop.run(messages, [])
+
+    assert success is True
+    assert "recovered" in summary
+
+
+# ---------------------------------------------------------------------------
+# build_task_prompt
+# ---------------------------------------------------------------------------
+
+def _make_task(title="Test task", body="Do something") -> Task:
+    return Task(index=0, title=title, body=body)
+
+
+def test_build_task_prompt_first_attempt():
+    task = _make_task(title="My task", body="Do something")
+    prompt = build_task_prompt(task, [], attempt=1)
+    assert "My task" in prompt
+    assert "Do something" in prompt
+    assert "retry" not in prompt.lower()
+
+
+def test_build_task_prompt_with_completed():
+    completed = [_make_task(title="Previous task")]
+    task = _make_task(title="Current task", body="Body")
+    prompt = build_task_prompt(task, completed, attempt=1)
+    assert "Previous task" in prompt
+    assert "Current task" in prompt
+
+
+def test_build_task_prompt_retry():
+    task = _make_task()
+    prompt = build_task_prompt(task, [], attempt=2)
+    assert "retry attempt 2" in prompt.lower() or "attempt 2" in prompt
