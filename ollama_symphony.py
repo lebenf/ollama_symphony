@@ -897,6 +897,77 @@ def build_tool_schemas(config: "WorkflowConfig") -> list[dict]:
 # ReAct loop
 # ---------------------------------------------------------------------------
 
+class StuckDetector:
+    """
+    Detects when the ReAct loop is not making progress and emits warnings.
+
+    Two patterns:
+    - identical_call_loop: same (tool, args) repeated REPEAT_THRESHOLD times in a row.
+    - repeated_failure: FAILURE_THRESHOLD consecutive tool calls all failed.
+    """
+
+    REPEAT_THRESHOLD = 3
+    FAILURE_THRESHOLD = 5
+
+    def __init__(self, logger: logging.Logger):
+        self._log = logger
+        # Each entry: (tool_name, args_key, success, output_snippet)
+        self._history: list[tuple[str, str, bool, str]] = []
+
+    def record(self, tool_call: ToolCall, result: ToolResult) -> None:
+        args_key = self._args_key(tool_call)
+        snippet = (result.output or "")[:200]
+        self._history.append((tool_call.name, args_key, result.success, snippet))
+
+    def check(self, iteration: int) -> None:
+        if len(self._history) < self.REPEAT_THRESHOLD:
+            return
+
+        tail = self._history[-self.REPEAT_THRESHOLD:]
+        names = [e[0] for e in tail]
+        keys = [e[1] for e in tail]
+
+        if len(set(names)) == 1 and len(set(keys)) == 1:
+            self._log.warning(
+                "stuck_detected pattern=identical_call_loop iteration=%d "
+                "tool=%r repeated=%d times args=%r last_output=%r",
+                iteration, names[0], self.REPEAT_THRESHOLD,
+                keys[0][:120], tail[-1][3],
+            )
+            return
+
+        if len(self._history) >= self.FAILURE_THRESHOLD:
+            fail_tail = self._history[-self.FAILURE_THRESHOLD:]
+            if all(not e[2] for e in fail_tail):
+                self._log.warning(
+                    "stuck_detected pattern=repeated_failure iteration=%d "
+                    "last_%d_tools=%r last_output=%r",
+                    iteration, self.FAILURE_THRESHOLD,
+                    [e[0] for e in fail_tail], fail_tail[-1][3],
+                )
+
+    def print_summary(self, last_n: int = 8) -> None:
+        """Print the last N tool calls to stderr to aid post-mortem diagnosis."""
+        if not self._history:
+            return
+        tail = self._history[-last_n:]
+        self._log.warning("--- stuck loop post-mortem: last %d tool calls ---", len(tail))
+        for i, (name, args_key, success, snippet) in enumerate(tail, 1):
+            status = "ok" if success else "FAIL"
+            self._log.warning(
+                "  [%d] %-20s %s  args=%s  output=%r",
+                i, name, status, args_key[:80], snippet,
+            )
+        self._log.warning("--- end post-mortem ---")
+
+    @staticmethod
+    def _args_key(tool_call: ToolCall) -> str:
+        try:
+            return json.dumps(tool_call.arguments, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return str(tool_call.arguments)
+
+
 class ReactLoop:
     """
     Implements the Reason+Act loop for a single task.
@@ -916,6 +987,7 @@ class ReactLoop:
         self._executor = executor
         self._config = config
         self._log = logging.getLogger("ollama_symphony.react")
+        self._stuck = StuckDetector(self._log)
 
     def run(self, messages: list[dict], tools: list[dict]) -> tuple[bool, str]:
         """
@@ -974,12 +1046,16 @@ class ReactLoop:
                     result.exit_code,
                 )
 
+                self._stuck.record(tool_call, result)
+                self._stuck.check(iteration)
+
                 messages = self._append_assistant_turn(messages, msg)
                 messages = self._append_tool_result(messages, tool_call.name, result)
 
             if task_done:
                 return True, task_summary
 
+        self._stuck.print_summary()
         return False, f"max_iterations ({self._config.max_iterations}) reached without task_complete"
 
     # ------------------------------------------------------------------
