@@ -416,11 +416,16 @@ ALL_TOOL_DEFS: dict[str, dict] = {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file.",
+            "description": (
+                "Read the contents of a file. "
+                "Use offset and limit (in characters) to paginate large files."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Relative path to the file"},
+                    "offset": {"type": "integer", "description": "Character offset to start reading from (default: 0)"},
+                    "limit": {"type": "integer", "description": "Maximum characters to read (default: 8000)"},
                 },
                 "required": ["path"],
             },
@@ -513,13 +518,26 @@ def execute_run_shell(command: str, working_dir: Path, timeout_s: int) -> ToolRe
 _READ_FILE_MAX_CHARS = 8000
 
 
-def execute_read_file(path_str: str, working_dir: Path) -> ToolResult:
+def execute_read_file(
+    path_str: str,
+    working_dir: Path,
+    offset: int = 0,
+    limit: int = _READ_FILE_MAX_CHARS,
+) -> ToolResult:
     try:
         safe = _safe_path(working_dir, path_str)
         content = safe.read_text(encoding="utf-8")
-        if len(content) > _READ_FILE_MAX_CHARS:
-            content = content[:_READ_FILE_MAX_CHARS] + f"\n[truncated — {len(content)} total chars]"
-        return ToolResult(tool_name="read_file", success=True, output=content)
+        total = len(content)
+        chunk = content[offset:offset + limit]
+        if not chunk and offset >= total:
+            return ToolResult(
+                tool_name="read_file", success=True,
+                output=f"[EOF — offset {offset} is past end of file ({total} chars total)]",
+            )
+        remaining = total - (offset + len(chunk))
+        header = f"[file={path_str} offset={offset} length={len(chunk)} total={total}]\n"
+        footer = f"\n[{remaining} more chars — call again with offset={offset + len(chunk)}]" if remaining > 0 else ""
+        return ToolResult(tool_name="read_file", success=True, output=header + chunk + footer)
     except ValueError as exc:
         return ToolResult(tool_name="read_file", success=False, output=str(exc))
     except FileNotFoundError:
@@ -578,7 +596,9 @@ class ToolExecutor:
                 return execute_run_shell(command, self._working_dir, self.config.shell_timeout_s)
             case "read_file":
                 path = tool_call.arguments.get("path", "")
-                return execute_read_file(path, self._working_dir)
+                offset = int(float(tool_call.arguments.get("offset", 0)))
+                limit = int(float(tool_call.arguments.get("limit", _READ_FILE_MAX_CHARS)))
+                return execute_read_file(path, self._working_dir, offset=offset, limit=limit)
             case "write_file":
                 path = tool_call.arguments.get("path", "")
                 content = tool_call.arguments.get("content", "")
@@ -624,7 +644,9 @@ def execute_tool(
     if name == "run_shell":
         return _tool_run_shell(args.get("command", ""), config, logger)
     elif name == "read_file":
-        return _tool_read_file(args.get("path", ""), config)
+        offset = int(float(args.get("offset", 0)))
+        limit = int(float(args.get("limit", _READ_FILE_MAX_CHARS)))
+        return _tool_read_file(args.get("path", ""), config, offset=offset, limit=limit)
     elif name == "write_file":
         return _tool_write_file(args.get("path", ""), args.get("content", ""), config)
     elif name == "list_directory":
@@ -664,19 +686,8 @@ def _tool_run_shell(command: str, config: "WorkflowConfig", logger: logging.Logg
         return ToolResult(tool_name="run_shell", success=False, output=str(exc))
 
 
-def _tool_read_file(path_str: str, config: "WorkflowConfig") -> ToolResult:
-    try:
-        safe = _safe_path(Path(config.working_dir), path_str)
-        content = safe.read_text(encoding="utf-8")
-        return ToolResult(tool_name="read_file", success=True, output=content)
-    except ValueError as exc:
-        return ToolResult(tool_name="read_file", success=False, output=str(exc))
-    except FileNotFoundError:
-        return ToolResult(
-            tool_name="read_file", success=False, output=f"File not found: {path_str}",
-        )
-    except Exception as exc:
-        return ToolResult(tool_name="read_file", success=False, output=str(exc))
+def _tool_read_file(path_str: str, config: "WorkflowConfig", offset: int = 0, limit: int = _READ_FILE_MAX_CHARS) -> ToolResult:
+    return execute_read_file(path_str, Path(config.working_dir), offset=offset, limit=limit)
 
 
 def _tool_write_file(path_str: str, content: str, config: "WorkflowConfig") -> ToolResult:
@@ -808,14 +819,26 @@ _TOOL_SCHEMAS: dict[str, dict] = {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the content of a file.",
+            "description": (
+                "Read the content of a file. "
+                "Use offset and limit to paginate large files (both in characters). "
+                "The response includes total file length and remaining chars so you know when to stop."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "File path relative to working directory",
-                    }
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Character offset to start reading from (default: 0)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum characters to read (default: 8000)",
+                    },
                 },
                 "required": ["path"],
             },
@@ -921,9 +944,13 @@ class StuckDetector:
         snippet = (result.output or "")[:200]
         self._history.append((tool_call.name, args_key, result.success, snippet))
 
-    def check(self, iteration: int) -> None:
+    def check(self, iteration: int) -> str | None:
+        """
+        Returns a corrective hint string if stuck, else None.
+        The caller should inject this into the conversation so the model sees it.
+        """
         if len(self._history) < self.REPEAT_THRESHOLD:
-            return
+            return None
 
         tail = self._history[-self.REPEAT_THRESHOLD:]
         names = [e[0] for e in tail]
@@ -936,7 +963,13 @@ class StuckDetector:
                 iteration, names[0], self.REPEAT_THRESHOLD,
                 keys[0][:120], tail[-1][3],
             )
-            return
+            return (
+                f"[SYSTEM INTERRUPT] You have called `{names[0]}` with identical arguments "
+                f"{self.REPEAT_THRESHOLD} times in a row and received the same result. "
+                "You are stuck in a loop. Stop repeating this call. "
+                "Try a completely different approach: use a different tool, different arguments, "
+                "or call `task_complete` if the task is already done."
+            )
 
         if len(self._history) >= self.FAILURE_THRESHOLD:
             fail_tail = self._history[-self.FAILURE_THRESHOLD:]
@@ -947,6 +980,16 @@ class StuckDetector:
                     iteration, self.FAILURE_THRESHOLD,
                     [e[0] for e in fail_tail], fail_tail[-1][3],
                 )
+                failed_tool = fail_tail[-1][0]
+                last_err = fail_tail[-1][3]
+                return (
+                    f"[SYSTEM INTERRUPT] The last {self.FAILURE_THRESHOLD} tool calls all failed. "
+                    f"Last failing tool: `{failed_tool}`. Last error: {last_err!r}. "
+                    "Stop retrying the same failing approach. "
+                    "Investigate why it is failing and try a different strategy."
+                )
+
+        return None
 
     def print_summary(self, last_n: int = 8) -> None:
         """Print the last N tool calls to stderr to aid post-mortem diagnosis."""
@@ -1049,10 +1092,13 @@ class ReactLoop:
                 )
 
                 self._stuck.record(tool_call, result)
-                self._stuck.check(iteration)
+                hint = self._stuck.check(iteration)
 
                 messages = self._append_assistant_turn(messages, msg)
                 messages = self._append_tool_result(messages, tool_call.name, result)
+
+                if hint:
+                    messages = messages + [{"role": "user", "content": hint}]
 
             if task_done:
                 return True, task_summary
@@ -1361,8 +1407,17 @@ class OllamaSymphonyRunner:
             self.log.info("[dry-run] Would run task %r via Ollama ReAct loop", task.title)
             return True, "[dry-run]"
 
+        cwd = str(Path(self.config.working_dir).resolve())
+        system_prompt = (
+            self.config.system_prompt.rstrip()
+            + f"\n\nWorking directory: {cwd}\n"
+            "All tool paths (read_file, write_file, list_directory) are relative to this directory. "
+            "run_shell commands also execute in this directory. "
+            "NEVER use absolute paths like /testbed, /workspace, /app, etc. — they do not exist."
+        )
+
         messages = build_initial_messages(
-            task, completed_so_far, self.config.system_prompt, attempt
+            task, completed_so_far, system_prompt, attempt
         )
         tools = build_tool_schemas(self.config)
         loop = ReactLoop(self._client, self._executor, self.config)

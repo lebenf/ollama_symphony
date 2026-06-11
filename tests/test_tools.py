@@ -96,7 +96,7 @@ def test_read_file_truncation(tmp_path):
     f.write_text("x" * 10000, encoding="utf-8")
     result = execute_read_file("big.txt", tmp_path)
     assert result.success is True
-    assert "truncated" in result.output
+    assert "more chars" in result.output
 
 
 # ---------------------------------------------------------------------------
